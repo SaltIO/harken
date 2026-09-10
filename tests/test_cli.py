@@ -6,15 +6,45 @@ live source. `_serve` (which blocks on uvicorn.run) is stubbed out.
 
 import csv
 import json
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import respx
 from typer.testing import CliRunner
 
 from harken import cli
+from harken.models import Mention
 from harken.store import Store
 
 runner = CliRunner()
+
+
+def test_retention_defaults_to_preview_and_export_preserves_provenance(tmp_path, monkeypatch):
+    path = tmp_path / "retention.db"
+    with Store(path) as db:
+        db.upsert([Mention(source="rss", query="CMBS", text="dated body",
+                           created_at=datetime.now(timezone.utc))])
+        first = db.mentions()[0]
+
+    class Future(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return first.fetched_at + timedelta(days=31)
+
+    monkeypatch.setattr(cli, "datetime", Future)
+    preview = runner.invoke(cli.app, ["retention", "--db", str(path)])
+    assert preview.exit_code == 0, preview.output
+    assert "Would expire 1 bodies" in preview.output
+    with Store(path) as db:
+        assert db.mentions()[0].text == "dated body"
+    applied = runner.invoke(cli.app, ["retention", "--db", str(path), "--yes"])
+    assert applied.exit_code == 0, applied.output
+    with Store(path) as db:
+        record = cli._mention_record(db.mentions()[0])
+        assert record["published_at"] is None
+        assert record["publication_provenance"] == "unknown"
+        assert record["fetched_at"] == first.fetched_at.isoformat()
+        assert record["body_expired"] and record["text"] == ""
 
 
 def test_demo_and_serve_default_to_the_same_db(tmp_path, monkeypatch):

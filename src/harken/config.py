@@ -123,6 +123,9 @@ class Config:
     )
     log_level: str = field(default_factory=_log_level_env)
     user_agent: str | None = field(default_factory=lambda: _clean_env("HARKEN_USER_AGENT"))
+    read_only: bool = field(
+        default_factory=lambda: _choice_env("HARKEN_READ_ONLY", "false", {"true", "false"}) == "true"
+    )
     # which sources to query (default = zero-config ones)
     sources: list[str] = field(
         default_factory=lambda: _env_list("HARKEN_SOURCES") or ["hackernews", "bluesky"]

@@ -226,7 +226,11 @@ def create_app(
     async def security_headers(request: Request, call_next):
         request.state.user = None
         path = request.url.path
-        if (
+        if runtime_config.read_only and request.method not in {"GET", "HEAD"}:
+            response = JSONResponse(
+                {"detail": "Read-only API"}, status_code=405, headers={"Allow": "GET, HEAD"}
+            )
+        elif (
             auth_mode == "basic"
             and path != "/health"
             and not _valid_basic_auth(
@@ -574,6 +578,37 @@ def create_app(
         finally:
             db.close()
 
+    @app.get("/api/mentions/page")
+    def api_mention_page(
+        q: str | None = None,
+        source: str | None = None,
+        since: datetime | None = None,
+        after_fetched_at: datetime | None = None,
+        after_id: str | None = None,
+        after_query: str | None = None,
+        limit: int = Query(200, ge=1, le=1000),
+    ):
+        cursor_parts = (after_fetched_at, after_id, after_query)
+        if any(part is not None for part in cursor_parts) and not all(
+            part is not None for part in cursor_parts
+        ):
+            raise HTTPException(status_code=422, detail="Supply every after cursor field")
+        if any(value is not None and value.tzinfo is None
+               for value in (since, after_fetched_at)):
+            raise HTTPException(status_code=422, detail="Cursor dates must include a timezone")
+        after = (
+            (after_fetched_at.astimezone(timezone.utc).isoformat(), after_id, after_query)
+            if after_fetched_at is not None else None
+        )
+        with store() as db:
+            rows = db.mention_page(query=q, source=source, since=since, after=after, limit=limit)
+        next_cursor = None
+        if len(rows) == limit:
+            last = rows[-1]
+            next_cursor = {"after_fetched_at": last.fetched_at.isoformat(),
+                           "after_id": last.id, "after_query": last.query}
+        return JSONResponse({"rows": [_view(m) for m in rows], "next_cursor": next_cursor})
+
     @app.get("/api/mentions")
     def api_mentions(
         q: str | None = None,
@@ -850,7 +885,13 @@ def _view(m: Mention) -> dict:
         "title": m.title,
         "text": m.text,
         "url": _safe_url(m.url),
+        "source_id": m.source_id,
         "created_at": m.created_at.isoformat(),
+        "published_at": m.published_at.isoformat() if m.published_at else None,
+        "publication_provenance": m.publication_provenance,
+        "source_updated_at": m.source_updated_at.isoformat() if m.source_updated_at else None,
+        "fetched_at": m.fetched_at.isoformat() if m.fetched_at else None,
+        "body_expired": m.body_expired,
         "reltime": _reltime(m.created_at),
         "score": m.score,
         "sentiment": m.sentiment.value if m.sentiment else "neutral",

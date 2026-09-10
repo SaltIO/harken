@@ -30,6 +30,11 @@ CREATE TABLE mentions (
     sentiment_score REAL,
     theme         TEXT,
     fetched_at    TEXT NOT NULL,
+    published_at  TEXT,
+    publication_provenance TEXT NOT NULL DEFAULT 'legacy_unknown',
+    source_updated_at TEXT,
+    body_expired INTEGER NOT NULL DEFAULT 0,
+    source_id TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (id, query)
 );
 """
@@ -37,6 +42,7 @@ CREATE TABLE mentions (
 _INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_query ON mentions(query);
 CREATE INDEX IF NOT EXISTS idx_created ON mentions(created_at);
+CREATE INDEX IF NOT EXISTS idx_fetched_page ON mentions(fetched_at, id, query);
 """
 
 _ALERT_SCHEMA = """
@@ -166,7 +172,7 @@ CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
 # Bumped when the on-disk schema or a one-time reconciliation step changes.
 # Stored in `PRAGMA user_version` so _ensure_schema() can skip the expensive
 # whole-table reconciliation on every connection once a DB is up to date.
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 class Store:
@@ -223,12 +229,33 @@ class Store:
                     "DROP INDEX IF EXISTS idx_query;\n"
                     "DROP INDEX IF EXISTS idx_created;\n"
                     + _CREATE_MENTIONS
-                    + "INSERT INTO mentions SELECT * FROM mentions_v1;\n"
+                    + "INSERT INTO mentions (id,source,query,author,title,text,url,created_at,"
+                    "score,sentiment,sentiment_score,theme,fetched_at) "
+                    "SELECT id,source,query,author,title,text,url,created_at,"
+                    "score,sentiment,sentiment_score,theme,fetched_at FROM mentions_v1;\n"
                     "DROP TABLE mentions_v1;\n"
                     "COMMIT;\n"
                 )
             elif primary_key != ["id", "query"]:
                 raise RuntimeError(f"Unsupported Harken database schema: primary key {primary_key}")
+            columns = {row["name"] for row in cur.execute("PRAGMA table_info(mentions)")}
+            for name, declaration in (
+                ("published_at", "TEXT"),
+                ("publication_provenance", "TEXT NOT NULL DEFAULT 'legacy_unknown'"),
+                ("source_updated_at", "TEXT"),
+                ("body_expired", "INTEGER NOT NULL DEFAULT 0"),
+                ("source_id", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in columns:
+                    cur.execute(f"ALTER TABLE mentions ADD COLUMN {name} {declaration}")
+            # Historical RSS created_at may be fetched-now or updated time.
+            # Never promote that ambiguous value into publication evidence.
+            cur.execute(
+                "UPDATE mentions SET published_at=created_at, "
+                "publication_provenance='source_created_at' "
+                "WHERE source!='rss' AND publication_provenance='legacy_unknown'"
+            )
+            cur.execute("UPDATE mentions SET source_id=source WHERE source_id=''")
             cur.executescript(
                 _INDEXES
                 + _ALERT_SCHEMA
@@ -568,23 +595,30 @@ class Store:
             # When update_theme is False the theme column is left out of the
             # UPDATE, preserving the stored label; otherwise it is set from the
             # incoming value (which may be NULL to clear a de-clustered label).
-            theme_update = "theme=excluded.theme,\n                        " if update_theme else ""
+            theme_update = (
+                "theme=CASE WHEN mentions.body_expired=1 THEN NULL ELSE excluded.theme END, "
+                if update_theme else ""
+            )
             upsert_sql = f"""
                 INSERT INTO mentions
                     (id, source, query, author, title, text, url, created_at,
-                     score, sentiment, sentiment_score, theme, fetched_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     score, sentiment, sentiment_score, theme, fetched_at,
+                     published_at, publication_provenance, source_updated_at, source_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id, query) DO UPDATE SET
                     source=excluded.source,
                     author=excluded.author,
-                    title=excluded.title,
-                    text=excluded.text,
+                    title=CASE WHEN mentions.body_expired=1 THEN NULL ELSE excluded.title END,
+                    text=CASE WHEN mentions.body_expired=1 THEN NULL ELSE excluded.text END,
                     url=excluded.url,
                     created_at=excluded.created_at,
                     sentiment=excluded.sentiment,
                     sentiment_score=excluded.sentiment_score,
                     {theme_update}score=excluded.score,
-                    fetched_at=excluded.fetched_at
+                    published_at=excluded.published_at,
+                    publication_provenance=excluded.publication_provenance,
+                    source_updated_at=excluded.source_updated_at,
+                    source_id=excluded.source_id
             """
             for m in mentions:
                 cur.execute("SELECT 1 FROM mentions WHERE id = ? AND query = ?", (m.id, m.query))
@@ -605,12 +639,78 @@ class Store:
                         m.sentiment_score,
                         m.theme,
                         now,
+                        m.published_at.isoformat() if m.published_at else None,
+                        m.publication_provenance,
+                        m.source_updated_at.isoformat() if m.source_updated_at else None,
+                        m.source_id,
                     ),
                 )
                 if not existed:
                     new += 1
         self._conn.commit()
         return new
+
+    def retention(
+        self, *, now: datetime, source: str | None = None, apply: bool = False,
+    ) -> dict[str, int]:
+        """Preview or explicitly apply 30-day body / 90-day identity retention.
+
+        Cutoffs use immutable first ingestion, not source publication. Expired
+        bodies cannot be resurrected by a replay while the identity is retained.
+        """
+        if now.tzinfo is None:
+            raise ValueError("Retention time must include a timezone")
+        body_cutoff = (now - timedelta(days=30)).astimezone(timezone.utc).isoformat()
+        identity_cutoff = (now - timedelta(days=90)).astimezone(timezone.utc).isoformat()
+        scope = " AND source=?" if source is not None else ""
+        source_args = [source] if source is not None else []
+        with closing(self._conn.cursor()) as cur:
+            if apply:
+                cur.execute("BEGIN IMMEDIATE")
+            try:
+                counts = {
+                    "bodies": cur.execute(
+                        "SELECT COUNT(*) FROM mentions WHERE fetched_at<? AND fetched_at>=? "
+                        "AND body_expired=0" + scope,
+                        [body_cutoff, identity_cutoff, *source_args],
+                    ).fetchone()[0],
+                    "identities": cur.execute(
+                        "SELECT COUNT(*) FROM mentions WHERE fetched_at<?" + scope,
+                        [identity_cutoff, *source_args],
+                    ).fetchone()[0],
+                    "alert_payloads": cur.execute(
+                        "SELECT COUNT(*) FROM threshold_alerts WHERE query IN "
+                        "(SELECT query FROM mentions WHERE fetched_at<?" + scope + ")",
+                        [body_cutoff, *source_args],
+                    ).fetchone()[0],
+                }
+                if apply:
+                    # Threshold payloads may quote multiple sources. They have
+                    # no item-level provenance, so discard the affected query's
+                    # payloads rather than retain an expired body indirectly.
+                    cur.execute(
+                        "DELETE FROM threshold_alerts WHERE query IN "
+                        "(SELECT query FROM mentions WHERE fetched_at<?" + scope + ")",
+                        [body_cutoff, *source_args],
+                    )
+                    cur.execute(
+                        "DELETE FROM alert_outbox WHERE (mention_id,query) IN "
+                        "(SELECT id,query FROM mentions WHERE fetched_at<?" + scope + ")",
+                        [identity_cutoff, *source_args],
+                    )
+                    cur.execute("DELETE FROM mentions WHERE fetched_at<?" + scope,
+                                [identity_cutoff, *source_args])
+                    cur.execute(
+                        "UPDATE mentions SET text=NULL,title=NULL,theme=NULL,body_expired=1 "
+                        "WHERE fetched_at<? AND body_expired=0" + scope,
+                        [body_cutoff, *source_args],
+                    )
+                    self._conn.commit()
+                return counts
+            except Exception:
+                if apply:
+                    self._conn.rollback()
+                raise
 
     def save_tracking(
         self, query: str, sources: list[str], *, project_id: int | None = None
@@ -1296,6 +1396,39 @@ class Store:
             cur.execute(sql, args)
             return [_row_to_mention(r) for r in cur.fetchall()]
 
+    def mention_page(
+        self, *, query: str | None = None, source: str | None = None,
+        since: datetime | None = None, after: tuple[str, str, str] | None = None,
+        limit: int = 200,
+    ) -> list[Mention]:
+        """Read a bounded page in immutable first-ingestion order.
+
+        Query is the third cursor component because (id, query) is the primary
+        key: one item matching two terms can share both fetched_at and id.
+        """
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        sql = "SELECT * FROM mentions WHERE 1=1"
+        args: list = []
+        if query is not None:
+            sql += " AND query=?"
+            args.append(query)
+        if source is not None:
+            sql += " AND source=?"
+            args.append(source)
+        if since is not None:
+            if since.tzinfo is None:
+                raise ValueError("since must include a timezone")
+            sql += " AND fetched_at>=?"
+            args.append(since.astimezone(timezone.utc).isoformat())
+        if after is not None:
+            sql += " AND (fetched_at,id,query)>(?,?,?)"
+            args.extend(after)
+        sql += " ORDER BY fetched_at,id,query LIMIT ?"
+        args.append(limit)
+        with closing(self._conn.cursor()) as cur:
+            return [_row_to_mention(row) for row in cur.execute(sql, args)]
+
     def queries(self, project_id: int | None = None) -> list[str]:
         with closing(self._conn.cursor()) as cur:
             sql = """
@@ -1430,6 +1563,13 @@ def _row_to_mention(r: sqlite3.Row) -> Mention:
         text=r["text"] or "",
         url=r["url"],
         created_at=datetime.fromisoformat(r["created_at"]),
+        published_at=datetime.fromisoformat(r["published_at"]) if r["published_at"] else None,
+        publication_provenance=r["publication_provenance"],
+        source_updated_at=(datetime.fromisoformat(r["source_updated_at"])
+                           if r["source_updated_at"] else None),
+        fetched_at=datetime.fromisoformat(r["fetched_at"]),
+        body_expired=bool(r["body_expired"]),
+        source_id=r["source_id"],
         score=r["score"],
         sentiment=Sentiment(r["sentiment"]) if r["sentiment"] else None,
         sentiment_score=r["sentiment_score"],

@@ -31,6 +31,93 @@ def test_upsert_and_dedupe(tmp_path):
     db.close()
 
 
+def test_fixed_multisource_replay_preserves_first_fetch_across_restart(tmp_path):
+    path = tmp_path / "replay.db"
+    batch = [mk("shared", query=q, source=s, url=f"https://{s}/1")
+             for s in ("rss", "hackernews") for q in ("CMBS", "EDGAR")]
+    for mention in batch:
+        if mention.source == "rss":
+            mention.source_id = "rss:stable-feed-fingerprint"
+    with Store(path) as db:
+        assert db.upsert(batch) == 4
+        first = {(m.id, m.query): m.fetched_at for m in db.mentions(limit=None)}
+        assert all(first.values())
+    with Store(path) as db:
+        assert db.upsert(batch) == 0
+        rows = db.mentions(limit=None)
+        assert {(m.id, m.query): m.fetched_at for m in rows} == first
+        assert all(m.published_at is None for m in rows if m.source == "rss")
+        assert all(m.source_id == "rss:stable-feed-fingerprint"
+                   for m in rows if m.source == "rss")
+        assert all(m.published_at == m.created_at for m in rows if m.source == "hackernews")
+        collected = []
+        cursor = None
+        while page := db.mention_page(after=cursor, limit=1):
+            m = page[0]
+            collected.append((m.id, m.query))
+            cursor = (m.fetched_at.isoformat(), m.id, m.query)
+        assert len(collected) == len(set(collected)) == 4
+        assert set(collected) == set(first)
+        since = min(first.values())
+        assert len(db.mention_page(source="rss", since=since)) == 2
+        assert db.mention_page(since=since + timedelta(days=1)) == []
+
+
+def test_v2_migration_preserves_ambiguous_rss_dates(tmp_path):
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as old:
+        old.execute("""CREATE TABLE mentions (
+            id TEXT NOT NULL, source TEXT NOT NULL, query TEXT NOT NULL,
+            author TEXT, title TEXT, text TEXT, url TEXT, created_at TEXT NOT NULL,
+            score INTEGER, sentiment TEXT, sentiment_score REAL, theme TEXT,
+            fetched_at TEXT NOT NULL, PRIMARY KEY(id,query))""")
+        for source in ("rss", "hackernews"):
+            old.execute("INSERT INTO mentions(id,source,query,created_at,fetched_at) "
+                        "VALUES(?,?,?,?,?)", (source, source, "CMBS",
+                        "2026-06-01T00:00:00+00:00", "2026-09-01T00:00:00+00:00"))
+        old.execute("PRAGMA user_version=2")
+    with Store(path) as db:
+        rows = {m.source: m for m in db.mentions()}
+        assert rows["rss"].published_at is None
+        assert rows["rss"].publication_provenance == "legacy_unknown"
+        assert rows["rss"].source_id == "rss"  # historical feed identity is unavailable
+        assert rows["hackernews"].published_at == rows["hackernews"].created_at
+        assert rows["rss"].fetched_at == datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+
+def test_retention_preview_expiry_replay_and_metadata_removal(tmp_path):
+    path = tmp_path / "retention.db"
+    rss = mk("old body", source="rss", url="https://rss/1")
+    rss.title = "old title"
+    rss.theme = "body-derived theme"
+    with Store(path) as db:
+        db.upsert([rss, mk("other source", url="https://hn/1")])
+        db.enqueue_alerts([rss], "target")
+        db.activate_threshold_alert("acme", "spike", "target", "old body",
+                                    {"text": "old body"}, cooldown_hours=0)
+        original = db.mentions(source="rss")[0]
+        later = original.fetched_at + timedelta(days=31)
+        assert db.retention(now=later, source="rss") == {
+            "bodies": 1, "identities": 0, "alert_payloads": 1}
+        assert db.mentions(source="rss")[0].text == "old body"
+        assert db.retention(now=later, source="rss", apply=True) == {
+            "bodies": 1, "identities": 0, "alert_payloads": 1}
+        assert db.upsert([rss]) == 0
+        expired = db.mentions(source="rss")[0]
+        assert expired.text == "" and expired.title is None and expired.body_expired
+        assert expired.theme is None
+        assert db._conn.execute("SELECT COUNT(*) FROM threshold_alerts").fetchone()[0] == 0
+        assert db.pending_alerts("acme", "target")[0].text == ""
+        assert expired.fetched_at == original.fetched_at
+        assert db.mentions(source="hackernews")[0].text == "other source"
+        assert db.retention(now=original.fetched_at + timedelta(days=91), source="rss") == {
+            "bodies": 0, "identities": 1, "alert_payloads": 0}
+        assert len(db.mentions()) == 2
+        assert db.retention(now=original.fetched_at + timedelta(days=91), source="rss",
+                            apply=True) == {"bodies": 0, "identities": 1, "alert_payloads": 0}
+        assert len(db.mentions()) == 1
+
+
 def test_upsert_updates_sentiment(tmp_path):
     db = Store(tmp_path / "t.db")
     db.upsert([mk("buggy", url="https://x/1")])

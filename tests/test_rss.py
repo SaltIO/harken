@@ -9,7 +9,7 @@ import respx
 
 from harken.config import Config
 from harken.pipeline import Pipeline
-from harken.sources.rss import RSSSource, _entry_time
+from harken.sources.rss import RSSSource, _entry_time, _retry_after_seconds
 
 _FEED_A = """<?xml version="1.0"?>
 <rss version="2.0"><channel>
@@ -159,3 +159,85 @@ def test_partial_failure_recovers_without_duplicate_mentions(tmp_path):
     assert pipe.store.source_state("acme", "rss")["last_error"] is None
     metrics = pipe.store.source_metrics()[0]
     assert metrics["last_success"] == 1 and metrics["errors_total"] == 1
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [200, 429])
+def test_batch_cache_fetches_each_url_once_including_failures(status):
+    route = respx.get("https://feeds.example/b.xml").mock(return_value=httpx.Response(
+        status, content=_FEED_B
+    ))
+    cache = {}
+    first = RSSSource(feeds=["https://feeds.example/b.xml"], batch_cache=cache).fetch_page("acme")
+    second = RSSSource(feeds=["https://feeds.example/b.xml"], batch_cache=cache).fetch_page("another")
+    assert route.call_count == 1
+    assert len(first.mentions) == len(second.mentions) == (1 if status == 200 else 0)
+    assert bool(first.errors) == bool(second.errors) == (status != 200)
+    if status == 200:
+        assert first.mentions[0].query == "acme"
+        assert second.mentions[0].query == "another"
+    RSSSource(feeds=["https://feeds.example/b.xml"], batch_cache={}).fetch_page("acme")
+    assert route.call_count == 2  # a new batch must refresh the upstream response
+
+
+@respx.mock
+@pytest.mark.parametrize("date_xml, published, updated", [
+    ("", False, False),
+    ("<updated>2024-01-02T00:00:00Z</updated>", False, True),
+    ("<published>2024-01-01T00:00:00Z</published>", True, False),
+    ("<published>2024-01-01T00:00:00Z</published>"
+     "<updated>2024-01-02T00:00:00Z</updated>", True, True),
+])
+def test_rss_publication_provenance_does_not_invent_dates(date_xml, published, updated):
+    atom = ('<feed xmlns="http://www.w3.org/2005/Atom"><title>Feed</title>'
+            '<entry><title>Acme</title><id>https://example.com/post</id>'
+            f'{date_xml}</entry></feed>')
+    respx.get("https://feeds.example/atom.xml").mock(return_value=httpx.Response(200, text=atom))
+    mention = RSSSource(feeds=["https://feeds.example/atom.xml"]).fetch("acme")[0]
+    assert (mention.published_at is not None) is published
+    assert (mention.source_updated_at is not None) is updated
+    assert mention.publication_provenance == ("source_published" if published else "unknown")
+    if published:
+        assert mention.published_at == datetime(2024, 1, 1, tzinfo=timezone.utc)
+    if updated:
+        assert mention.source_updated_at == datetime(2024, 1, 2, tzinfo=timezone.utc)
+
+
+@respx.mock
+def test_rss_source_identity_is_stable_per_feed_without_url_credentials():
+    feed_a = "https://feeds.example/a.xml?token=private-a"
+    feed_b = "https://feeds.example/b.xml?token=private-b"
+    respx.get(feed_a).mock(return_value=httpx.Response(200, content=_FEED_A))
+    respx.get(feed_b).mock(return_value=httpx.Response(200, content=_FEED_B))
+    mentions = RSSSource(feeds=[feed_a, feed_b]).fetch("acme")
+    assert mentions[0].source_id == mentions[1].source_id
+    assert mentions[0].source_id != mentions[2].source_id
+    assert all(mention.source_id.startswith("rss:") and len(mention.source_id) == 68
+               for mention in mentions)
+    assert "private-" not in " ".join(mention.source_id for mention in mentions)
+    repeated = RSSSource(feeds=[feed_a]).fetch("acme")
+    assert repeated[0].source_id == mentions[0].source_id
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("7200", 7200), ("7200.01", 7201), ("0", 0), ("-1", None),
+    ("NaN", None), ("Infinity", None), ("invalid", None), (None, None),
+    ("1e5000", None),
+    ("Thu, 10 Sep 2026 14:00:00 GMT", 7200),
+    ("Thu, 10 Sep 2026 10:00:00 GMT", 0),
+    ("999999999999999999999", 999999999999999999999),
+])
+def test_retry_after_preserves_long_delays_and_rejects_invalid(value, expected):
+    assert _retry_after_seconds(value, now=datetime(2026, 9, 10, 12, tzinfo=timezone.utc)) == expected
+
+
+@respx.mock
+def test_retry_after_marker_survives_cached_feed_failure():
+    route = respx.get("https://feeds.example/retry.xml").respond(
+        429, headers={"Retry-After": "7200.5"},
+    )
+    cache = {}
+    for term in ("first", "second"):
+        page = RSSSource(feeds=["https://feeds.example/retry.xml"], batch_cache=cache).fetch_page(term)
+        assert page.errors == ["feed[1] HTTPStatusError HTTP 429 retry_after_seconds=7201"]
+    assert route.call_count == 1

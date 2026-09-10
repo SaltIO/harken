@@ -6,8 +6,12 @@ Filters feed entries to those mentioning the query. Configure feeds via
 
 from __future__ import annotations
 
+import math
 from calendar import timegm
 from datetime import datetime, timezone
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
+from hashlib import sha256
 
 import feedparser
 import httpx
@@ -21,9 +25,11 @@ class RSSSource(Source):
     label = "RSS"
     needs_config = True  # needs at least one feed URL
 
-    def __init__(self, feeds: list[str] | None = None, **options):
+    def __init__(self, feeds: list[str] | None = None, batch_cache: dict | None = None, **options):
         super().__init__(**options)
         self.feeds = feeds or []
+        # Owned by one batch invocation; never retain feed responses globally.
+        self.batch_cache = batch_cache
 
     def fetch(self, query: str, limit: int = 50) -> list[Mention]:
         page = self.fetch_page(query, limit)
@@ -42,23 +48,16 @@ class RSSSource(Source):
         errors: list[str] = []
         with self._client() as client:
             for feed_number, feed_url in enumerate(self.feeds, start=1):
-                try:
-                    resp = client.get(feed_url)
-                    resp.raise_for_status()
-                except httpx.HTTPError as exc:
-                    # Feed URLs can contain credentials; identify the configured
-                    # position and error class without serializing the raw URL.
-                    status = f" HTTP {exc.response.status_code}" if isinstance(
-                        exc, httpx.HTTPStatusError
-                    ) else ""
-                    errors.append(f"feed[{feed_number}] {type(exc).__name__}{status}")
+                cached = self.batch_cache.get(feed_url) if self.batch_cache is not None else None
+                if cached is None:
+                    cached = self._fetch_feed(client, feed_url)
+                    if self.batch_cache is not None:
+                        self.batch_cache[feed_url] = cached
+                parsed, error = cached
+                if error:
+                    errors.append(f"feed[{feed_number}] {error}")
+                if parsed is None:
                     continue
-                parsed = feedparser.parse(resp.content)
-                if not parsed.version:
-                    errors.append(f"feed[{feed_number}] invalid RSS/Atom document")
-                    continue
-                if parsed.bozo:
-                    errors.append(f"feed[{feed_number}] malformed RSS/Atom document")
                 for entry in parsed.entries:
                     title = entry.get("title", "")
                     summary = entry.get("summary", "")
@@ -66,25 +65,81 @@ class RSSSource(Source):
                     if q not in blob:
                         continue
                     created = _entry_time(entry)
+                    published = _entry_date(entry, "published_parsed")
                     mentions.append(
                         Mention(
                             source=self.name,
+                            source_id="rss:" + sha256(feed_url.encode()).hexdigest(),
                             query=query,
                             author=entry.get("author"),
                             title=title or None,
                             text=strip_html(summary),
                             url=entry.get("link"),
                             created_at=created,
+                            published_at=published,
+                            publication_provenance="source_published" if published else "unknown",
+                            source_updated_at=_entry_date(entry, "updated_parsed"),
                         )
                     )
         return FetchPage(mentions[:limit], errors=errors)
 
+    @staticmethod
+    def _fetch_feed(
+        client: httpx.Client, feed_url: str,
+    ) -> tuple[feedparser.FeedParserDict | None, str | None]:
+        try:
+            resp = client.get(feed_url)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            # Cache only a sanitized descriptor: feed URLs may contain secrets.
+            status = f" HTTP {exc.response.status_code}" if isinstance(
+                exc, httpx.HTTPStatusError
+            ) else ""
+            retry = None
+            if isinstance(exc, httpx.HTTPStatusError):
+                retry = _retry_after_seconds(exc.response.headers.get("Retry-After"))
+            marker = f" retry_after_seconds={retry}" if retry is not None else ""
+            return None, f"{type(exc).__name__}{status}{marker}"
+        parsed = feedparser.parse(resp.content)
+        if not parsed.version:
+            return None, "invalid RSS/Atom document"
+        return parsed, "malformed RSS/Atom document" if parsed.bozo else None
+
 
 def _entry_time(entry) -> datetime:
+    """Legacy operational ordering time; not evidence of source publication."""
     for key in ("published_parsed", "updated_parsed"):
-        t = entry.get(key)
-        if t:
-            # feedparser's struct_time is UTC; time.mktime() interprets it as
-            # local time and shifts timestamps on non-UTC hosts.
-            return datetime.fromtimestamp(timegm(t), tz=timezone.utc)
+        parsed = _entry_date(entry, key)
+        if parsed is not None:
+            return parsed
     return datetime.now(timezone.utc)
+
+
+def _entry_date(entry, key: str) -> datetime | None:
+    # FeedParserDict.get aliases absent updated_parsed to published_parsed;
+    # membership distinguishes an actual source update from that fallback.
+    value = entry.get(key) if key in entry else None
+    if value:
+        # feedparser's struct_time is UTC, not the host's local timezone.
+        return datetime.fromtimestamp(timegm(value), tz=timezone.utc)
+    return None
+
+
+def _retry_after_seconds(value: str | None, *, now: datetime | None = None) -> int | None:
+    """Normalize a retry delay without logging arbitrary header text or capping it."""
+    if value is None:
+        return None
+    try:
+        seconds = Decimal(value.strip())
+    except InvalidOperation:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            delay = (date - (now or datetime.now(timezone.utc))).total_seconds()
+            seconds = Decimal(str(max(0.0, delay)))
+        except (ValueError, TypeError, OverflowError):
+            return None
+    if not seconds.is_finite() or seconds < 0 or not math.isfinite(float(seconds)):
+        return None
+    return int(seconds.to_integral_value(rounding=ROUND_CEILING))

@@ -22,6 +22,30 @@ Get sentiment and themes in a clean local dashboard. No Harken account, telemetr
 
 ## Why Harken
 
+This fork adds bounded multi-term collection, honest RSS failure reporting,
+publication provenance, immutable first-fetch timestamps, and a read-only API mode.
+`HARKEN_USER_AGENT` sets a contact-bearing HTTP user agent. Install this fork
+with `uv sync --locked` to reproduce the checked-in dependency resolution.
+
+```bash
+# One sequential batch; one configured RSS feed is fetched once for all terms.
+uv run python -m harken.batch --terms example another --db harken.db \
+  --receipt batch-result.json
+
+# Loopback API that rejects mutation requests, including manual collection.
+HARKEN_READ_ONLY=true uv run harken serve --host 127.0.0.1 --port 8042
+
+# Preview only: 30-day body expiry, 90-day identity expiry. No automatic deletion.
+uv run harken retention --db harken.db
+```
+
+Set `HARKEN_RSS_FEEDS` to exactly one feed for the batch command. The caller
+owns scheduling and locking, and must honor the receipt's `retry_after_seconds`
+before another batch. The API's `/api/mentions/page` accepts source/query/time
+filters and returns a stable three-part cursor. Undated RSS publication remains
+null; `created_at` alone is an operational ordering time, not publication proof.
+The original quickstart and wider adapter interface are documented below.
+
 Brand-monitoring tools like Brand24 and Mention are capable — and closed, cloud-only, and now priced in the **hundreds of dollars per month**. They ingest everything you track into their servers. For indie founders, OSS maintainers, and privacy-conscious teams, that's often backwards.
 
 Harken does the core job those tools do — **"what are people saying about X, and is it good or bad?"** — as a small open-source program you run yourself:
@@ -59,9 +83,9 @@ Harken is the small, honest, self-hosted version: point it at a keyword, and it 
 Requires Python 3.10+. (Examples use [`uv`](https://github.com/astral-sh/uv); plain `pip` works too.)
 
 ```bash
-git clone https://github.com/VladUZH/harken
+git clone https://github.com/SaltIO/harken
 cd harken
-uv venv && uv pip install -e .
+uv sync --locked
 
 # 1. See the whole thing on bundled sample data — no key, no network:
 harken demo

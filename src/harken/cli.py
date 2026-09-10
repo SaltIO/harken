@@ -714,6 +714,22 @@ def prune(
     console.print(f"[green]✓[/green] removed {deleted} mentions{scope}")
 
 
+@app.command("retention")
+def retain_data(
+    source: str | None = typer.Option(None, help="Limit retention to this source."),
+    yes: bool = typer.Option(False, "--yes", help="Apply reviewed expiry; default is a preview."),
+    db: str | None = typer.Option(None, help="Database path (default: configured HARKEN_DB)."),
+):
+    """Preview 30-day body expiry and 90-day identity removal, by first ingestion."""
+    with Store(db or Config().db_path) as store:
+        result = store.retention(now=datetime.now(timezone.utc), source=source, apply=yes)
+    verb = "Expired" if yes else "Would expire"
+    console.print(f"{verb} {result['bodies']} bodies and {result['identities']} identities.")
+    console.print(f"{verb} {result['alert_payloads']} associated threshold-alert payloads.")
+    if not yes:
+        console.print("Review the preview, then pass --yes to apply. No retention changes made.")
+
+
 @app.command("test-alert")
 def test_alert(
     webhook_url: str = typer.Option(
@@ -883,6 +899,13 @@ def _mention_record(mention) -> dict:
         "text": mention.text,
         "url": mention.url,
         "created_at": mention.created_at.isoformat(),
+        "published_at": mention.published_at.isoformat() if mention.published_at else None,
+        "publication_provenance": mention.publication_provenance,
+        "source_updated_at": (mention.source_updated_at.isoformat()
+                              if mention.source_updated_at else None),
+        "fetched_at": mention.fetched_at.isoformat() if mention.fetched_at else None,
+        "body_expired": mention.body_expired,
+        "source_id": mention.source_id,
         "score": mention.score,
         "sentiment": mention.sentiment.value if mention.sentiment else None,
         "sentiment_score": mention.sentiment_score,

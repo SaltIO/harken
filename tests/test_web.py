@@ -39,6 +39,50 @@ def seeded_db(tmp_path):
     return str(db_path)
 
 
+def test_read_only_api_rejects_every_mutating_method_before_pipeline(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARKEN_READ_ONLY", "true")
+    calls = []
+
+    def forbidden_pipeline(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("Read-only API must not construct a collector")
+
+    monkeypatch.setattr("harken.web.app.Pipeline", forbidden_pipeline)
+    client = TestClient(create_app(db_path=seeded_db(tmp_path)))
+    assert client.get("/api/mentions/page").status_code == 200
+    for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+        response = client.request(method, "/api/track", json={"query": "CMBS"})
+        assert response.status_code == 405
+        assert response.headers["Allow"] == "GET, HEAD"
+    assert client.post("/api/projects", json={"name": "bypass"}).status_code == 405
+    assert calls == []
+
+
+def test_mention_page_stable_ties_filters_and_provenance(tmp_path):
+    path = str(tmp_path / "pages.db")
+    with Store(path) as db:
+        db.upsert([mk("shared", query=q, source=s, url=f"https://{s}/1")
+                   for s in ("rss", "hackernews") for q in ("CMBS", "EDGAR")])
+    client = TestClient(create_app(path))
+    params = {"limit": 1, "source": "rss"}
+    collected = []
+    while True:
+        response = client.get("/api/mentions/page", params=params)
+        assert response.status_code == 200, response.text
+        page = response.json()
+        collected.extend(page["rows"])
+        if page["next_cursor"] is None:
+            break
+        params.update(page["next_cursor"])
+    assert len(collected) == 2
+    assert {r["query"] for r in collected} == {"CMBS", "EDGAR"}
+    assert all(r["published_at"] is None and r["fetched_at"] for r in collected)
+    for invalid in ({"after_id": "partial"}, {"since": "2026-01-01T00:00:00"},
+                    {"limit": 1001}):
+        assert client.get("/api/mentions/page", params=invalid).status_code == 422
+
+
+
 def account_client(tmp_path, role="admin"):
     db_path = str(tmp_path / f"accounts-{role}.db")
     with Store(db_path) as store:

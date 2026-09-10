@@ -25,11 +25,12 @@ class Sentiment(str, Enum):
 class Mention(BaseModel):
     """A single thing someone said, somewhere, that matched a tracked query.
 
-    ``id`` is a stable content hash so the same item fetched twice (or by two
-    overlapping queries) de-duplicates cleanly in the store.
+    ``id`` fingerprints the URL, or source/author/content when no URL exists.
+    The store associates this identity with each matching query separately.
     """
 
     id: str = ""
+    source_id: str = ""
     source: str  # e.g. "hackernews", "reddit", "mastodon"
     query: str  # the tracked term this mention matched
     author: str | None = None
@@ -37,6 +38,13 @@ class Mention(BaseModel):
     text: str = ""
     url: str | None = None
     created_at: datetime
+    # created_at remains the operational ordering timestamp. Only published_at
+    # with provenance establishes publication; undated RSS must stay unknown.
+    published_at: datetime | None = None
+    publication_provenance: str = "source_created_at"
+    source_updated_at: datetime | None = None
+    fetched_at: datetime | None = None
+    body_expired: bool = False
     score: int | None = None  # upvotes / points / favourites, source-dependent
 
     # Populated by analyzers (None until analysed).
@@ -60,6 +68,13 @@ class Mention(BaseModel):
         return value
 
     def model_post_init(self, __context) -> None:  # noqa: D401
+        if not self.source_id:
+            self.source_id = self.source
+        if self.published_at is None and self.publication_provenance == "source_created_at":
+            if self.source == "rss":
+                self.publication_provenance = "unknown"
+            else:
+                self.published_at = self.created_at
         if not self.id:
             self.id = self.compute_id()
 
