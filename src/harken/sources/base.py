@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import html
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import httpx
@@ -16,10 +16,15 @@ USER_AGENT = "harken/0.1 (+https://github.com/VladUZH/harken)"
 
 @dataclass
 class FetchPage:
-    """One source page plus an opaque cursor for the next, older page."""
+    """One source page, next cursor, and any partial collection failures.
+
+    Failed pages can retain useful mentions, but must not advance the source's
+    success cursor. Errors should identify failures without exposing credentials.
+    """
 
     mentions: list[Mention]
     next_cursor: str | None = None
+    errors: list[str] = field(default_factory=list)
 
 
 class Source:
@@ -60,7 +65,8 @@ class Source:
 
     # -- helpers -------------------------------------------------------------
     def _client(self, **kwargs) -> httpx.Client:
-        headers = {"User-Agent": USER_AGENT, **kwargs.pop("headers", {})}
+        headers = {"User-Agent": self.options.get("user_agent") or USER_AGENT,
+                   **kwargs.pop("headers", {})}
         return httpx.Client(headers=headers, timeout=15.0, **kwargs)
 
 

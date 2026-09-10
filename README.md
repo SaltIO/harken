@@ -242,11 +242,12 @@ Everything is optional and has a sane default — see [`.env.example`](.env.exam
 | `HARKEN_DB` | `harken.db` | SQLite path. |
 | `HARKEN_LOG_FORMAT` | `console` | Human-readable `console` or machine-readable `json` application logs. |
 | `HARKEN_LOG_LEVEL` | `INFO` | Minimum application log severity. |
-| `HARKEN_RETRIES` | `2` | Retries for network, HTTP 429, and HTTP 5xx failures. |
+| `HARKEN_RETRIES` | `2` | Retries for network, HTTP 429, and HTTP 5xx failures. RSS reports feed failures for the next scheduled scan rather than immediately retrying the entire feed list. |
 | `HARKEN_RETRY_BACKOFF` | `1.0` | Initial exponential-backoff delay in seconds. |
 | `HARKEN_LLM_PROVIDER` | `none` | `none` \| `anthropic` \| `openai` \| `ollama`. |
 | `HARKEN_SENTIMENT_ANALYZER` | `lexicon` | Transparent local `lexicon` or explicitly opt-in batched `llm`. |
 | `HARKEN_RSS_FEEDS` | — | Comma-separated feed URLs. |
+| `HARKEN_USER_AGENT` | Harken project User-Agent | Optional printable ASCII HTTP User-Agent, including your operator contact URL/email. |
 | `HARKEN_X_BEARER_TOKEN` | — | App-only bearer token for X API v2 recent search. |
 | `HARKEN_YOUTUBE_API_KEY` | — | API key for YouTube Data API v3 video search. |
 | `HARKEN_WEBHOOK_URL` | — | Generic or Slack webhook for mention and threshold alerts. |

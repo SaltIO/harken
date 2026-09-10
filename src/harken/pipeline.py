@@ -129,7 +129,8 @@ class Pipeline:
                 )
                 continue
             try:
-                source = source_cls(**self.config.source_options(name))
+                source = source_cls(user_agent=self.config.user_agent,
+                                    **self.config.source_options(name))
                 cursor = (
                     state.get("backfill_cursor") if backfill else state.get("incremental_cursor")
                 )
@@ -152,18 +153,22 @@ class Pipeline:
                         since=since,
                     )
                     source_mentions.extend(page.mentions)
+                    if page.errors:
+                        result.errors[name] = "; ".join(page.errors)
+                        self.store.record_source_error(query, name, result.errors[name])
                     result.pages_by_source[name] = page_number + 1
                     next_cursor = page.next_cursor
-                    if not next_cursor:
+                    if page.errors or not next_cursor:
                         break
                     cursor = next_cursor
                 unique_mentions = list(
                     {mention.id: mention for mention in source_mentions}.values()
                 )
                 collected.extend(unique_mentions)
-                successful[name] = (unique_mentions, next_cursor, incremental_since)
+                if name not in result.errors:
+                    successful[name] = (unique_mentions, next_cursor, incremental_since)
                 result.by_source[name] = len(unique_mentions)
-                if backfill:
+                if backfill and name not in result.errors:
                     result.backfill_complete[name] = next_cursor is None
             except Exception as e:  # isolate per-source failures
                 result.errors[name] = f"{type(e).__name__}: {e}"

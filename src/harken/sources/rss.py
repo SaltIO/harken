@@ -13,7 +13,7 @@ import feedparser
 import httpx
 
 from harken.models import Mention
-from harken.sources.base import Source, strip_html
+from harken.sources.base import FetchPage, Source, strip_html
 
 
 class RSSSource(Source):
@@ -26,18 +26,39 @@ class RSSSource(Source):
         self.feeds = feeds or []
 
     def fetch(self, query: str, limit: int = 50) -> list[Mention]:
+        page = self.fetch_page(query, limit)
+        if page.errors and not page.mentions:
+            raise RuntimeError("; ".join(page.errors))
+        return page.mentions
+
+    def fetch_page(
+        self, query: str, limit: int = 50, *, cursor: str | None = None,
+        since: datetime | None = None,
+    ) -> FetchPage:
         if not self.feeds:
             raise RuntimeError("RSS requires at least one URL in HARKEN_RSS_FEEDS")
         q = query.casefold()
         mentions: list[Mention] = []
+        errors: list[str] = []
         with self._client() as client:
-            for feed_url in self.feeds:
+            for feed_number, feed_url in enumerate(self.feeds, start=1):
                 try:
                     resp = client.get(feed_url)
                     resp.raise_for_status()
-                except httpx.HTTPError:
-                    continue  # one bad/slow feed shouldn't cost the others their fetch
+                except httpx.HTTPError as exc:
+                    # Feed URLs can contain credentials; identify the configured
+                    # position and error class without serializing the raw URL.
+                    status = f" HTTP {exc.response.status_code}" if isinstance(
+                        exc, httpx.HTTPStatusError
+                    ) else ""
+                    errors.append(f"feed[{feed_number}] {type(exc).__name__}{status}")
+                    continue
                 parsed = feedparser.parse(resp.content)
+                if not parsed.version:
+                    errors.append(f"feed[{feed_number}] invalid RSS/Atom document")
+                    continue
+                if parsed.bozo:
+                    errors.append(f"feed[{feed_number}] malformed RSS/Atom document")
                 for entry in parsed.entries:
                     title = entry.get("title", "")
                     summary = entry.get("summary", "")
@@ -56,7 +77,7 @@ class RSSSource(Source):
                             created_at=created,
                         )
                     )
-        return mentions[:limit]
+        return FetchPage(mentions[:limit], errors=errors)
 
 
 def _entry_time(entry) -> datetime:

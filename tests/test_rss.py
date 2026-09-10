@@ -7,6 +7,8 @@ import httpx
 import pytest
 import respx
 
+from harken.config import Config
+from harken.pipeline import Pipeline
 from harken.sources.rss import RSSSource, _entry_time
 
 _FEED_A = """<?xml version="1.0"?>
@@ -81,3 +83,79 @@ def test_requires_at_least_one_feed():
 def test_feed_struct_time_is_interpreted_as_utc():
     entry = {"published_parsed": struct_time((2024, 1, 1, 0, 0, 0, 0, 1, 0))}
     assert _entry_time(entry) == datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+
+@respx.mock
+@pytest.mark.parametrize("successful_feed", [False, True])
+def test_pipeline_records_rss_failure_without_discarding_good_entries(tmp_path, successful_feed):
+    feeds = ["https://feeds.example/broken.xml?token=private-value"]
+    respx.get(feeds[0]).mock(return_value=httpx.Response(503))
+    if successful_feed:
+        feeds.append("https://feeds.example/b.xml")
+        respx.get(feeds[1]).mock(return_value=httpx.Response(200, content=_FEED_B))
+    pipe = Pipeline(Config(db_path=str(tmp_path / "test.db"), sources=["rss"],
+                           rss_feeds=feeds, source_retries=2))
+    result = pipe.track("acme")
+    assert "HTTP 503" in result.errors["rss"]
+    assert "private-value" not in result.errors["rss"]
+    assert result.new == (1 if successful_feed else 0)
+    assert len(pipe.store.mentions(query="acme")) == result.new
+    metrics = pipe.store.source_metrics()[0]
+    assert metrics["errors_total"] == 1 and metrics["last_success"] == 0
+    assert metrics["fetched_total"] == result.new
+    state = pipe.store.source_state("acme", "rss")
+    assert state["last_error"]
+    assert not state.get("last_success_at")
+    # A page reporting partial failure is not retried as a whole: successful
+    # feeds are retained without a tight retry loop over every URL.
+    assert len(respx.calls) == len(feeds)
+
+
+@respx.mock
+def test_pipeline_empty_feed_is_success_and_contact_user_agent_reaches_wire(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARKEN_USER_AGENT", "example-listener/1.0 (+https://example.com/contact)")
+    feed = respx.get("https://feeds.example/empty.xml").mock(return_value=httpx.Response(
+        200, content='<rss version="2.0"><channel><title>Empty</title></channel></rss>'
+    ))
+    pipe = Pipeline(Config(db_path=str(tmp_path / "test.db"), sources=["rss"],
+                           rss_feeds=["https://feeds.example/empty.xml"]))
+    result = pipe.track("acme")
+    assert result.errors == {} and result.fetched == 0
+    assert pipe.store.source_metrics()[0]["last_success"] == 1
+    assert feed.calls[0].request.headers["User-Agent"] == (
+        "example-listener/1.0 (+https://example.com/contact)"
+    )
+
+
+@respx.mock
+def test_http_200_non_feed_is_not_healthy(tmp_path):
+    respx.get("https://feeds.example/a.xml").mock(return_value=httpx.Response(
+        200, text="<html><body>Gateway login</body></html>"
+    ))
+    pipe = Pipeline(Config(db_path=str(tmp_path / "test.db"), sources=["rss"],
+                           rss_feeds=["https://feeds.example/a.xml"]))
+    result = pipe.track("acme")
+    assert "invalid RSS/Atom" in result.errors["rss"]
+    assert pipe.store.source_metrics()[0]["last_success"] == 0
+
+
+def test_user_agent_rejects_header_control_characters(monkeypatch):
+    monkeypatch.setenv("HARKEN_USER_AGENT", "listener\r\nX-Extra: value")
+    with pytest.raises(ValueError, match="printable ASCII"):
+        Config()
+
+
+@respx.mock
+def test_partial_failure_recovers_without_duplicate_mentions(tmp_path):
+    broken = respx.get("https://feeds.example/a.xml").mock(return_value=httpx.Response(500))
+    respx.get("https://feeds.example/b.xml").mock(return_value=httpx.Response(200, content=_FEED_B))
+    pipe = Pipeline(Config(db_path=str(tmp_path / "test.db"), sources=["rss"],
+                           rss_feeds=["https://feeds.example/a.xml", "https://feeds.example/b.xml"]))
+    assert pipe.track("acme").new == 1
+    broken.mock(return_value=httpx.Response(200, content=_FEED_A))
+    recovered = pipe.track("acme")
+    assert recovered.errors == {} and recovered.new == 2
+    assert len(pipe.store.mentions(query="acme")) == 3
+    assert pipe.store.source_state("acme", "rss")["last_error"] is None
+    metrics = pipe.store.source_metrics()[0]
+    assert metrics["last_success"] == 1 and metrics["errors_total"] == 1

@@ -122,6 +122,7 @@ class Config:
         default_factory=lambda: _choice_env("HARKEN_LOG_FORMAT", "console", {"console", "json"})
     )
     log_level: str = field(default_factory=_log_level_env)
+    user_agent: str | None = field(default_factory=lambda: _clean_env("HARKEN_USER_AGENT"))
     # which sources to query (default = zero-config ones)
     sources: list[str] = field(
         default_factory=lambda: _env_list("HARKEN_SOURCES") or ["hackernews", "bluesky"]
@@ -207,6 +208,11 @@ class Config:
     session_secure: bool = field(default_factory=lambda: _bool_env("HARKEN_SESSION_SECURE", False))
 
     def __post_init__(self) -> None:
+        if self.user_agent is not None and (
+            not self.user_agent.isascii()
+            or any(ord(char) < 32 or ord(char) == 127 for char in self.user_agent)
+        ):
+            raise ValueError("HARKEN_USER_AGENT must contain printable ASCII characters")
         if self.smtp_port > 65535:
             raise ValueError(f"HARKEN_SMTP_PORT must be at most 65535 (got {self.smtp_port})")
         email_values = bool(
