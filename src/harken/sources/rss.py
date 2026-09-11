@@ -67,6 +67,7 @@ class RSSSource(Source):
                         Mention(
                             source=self.name,
                             source_id="rss:" + sha256(feed_url.encode()).hexdigest(),
+                            source_item_id=entry.get("id") or entry.get("guid"),
                             query=query,
                             author=entry.get("author"),
                             title=title or None,
@@ -78,7 +79,7 @@ class RSSSource(Source):
                             source_updated_at=_entry_date(entry, "updated_parsed"),
                         )
                     )
-        return FetchPage(mentions[:limit], errors=errors)
+        return FetchPage(mentions[:limit], errors=errors, truncated=len(mentions) > limit)
 
     @staticmethod
     def _fetch_feed(

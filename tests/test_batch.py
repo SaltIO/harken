@@ -59,8 +59,60 @@ def test_sequential_batch_fetches_feed_once_and_stores_each_query(tmp_path, rout
         metrics = {item["source"]: item for item in store.source_metrics()}
         assert metrics["rss"]["scans_total"] == 3
         assert metrics["bluesky"]["fetched_total"] == 0  # A genuine empty parsed fixture result.
+        revisions = store.coverage_page()["rows"]
+        assert len(revisions) == 18
+        attempts = list({r["attempt_id"]: r for r in revisions}.values())
+        assert len(attempts) == 9
+        assert sum(row["http_requests"] for row in attempts) == 7
+        rss_attempts = [r for r in attempts if r["source"] == "rss"]
+        assert [r["http_requests"] for r in rss_attempts] == [1, 0, 0]
+        assert all(r["source_id"].startswith("rss:") for r in rss_attempts)
+        assert all(r["profile_id"] is None for r in attempts)
+        assert all(r["landing"] == "stored" for r in attempts)
     finally:
         store.close()
+
+
+def test_coverage_preserves_failure_then_zero_and_actual_scope(tmp_path, routes):
+    _, _, bluesky, _ = routes
+    def response(request):
+        return httpx.Response(403 if request.url.params["q"] == "CMBS" else 200,
+                              json={"posts": []})
+    bluesky.mock(side_effect=response)
+    path = tmp_path / "coverage.db"
+    collect(TERMS, sources=["bluesky"], db_path=str(path),
+            profile_id="caller-profile", profile_version="1")
+    with Store(path) as db:
+        first = db.coverage_page(source="bluesky", limit=1)
+        rest = db.coverage_page(source="bluesky", cursor=first["next_cursor"])
+        revisions = first["rows"] + rest["rows"]
+        rows = list({r["attempt_id"]: r for r in revisions}.values())
+        assert [r["execution"] for r in rows] == ["failed", "completed", "completed"]
+        assert [r["returned_count"] for r in rows] == [None, 0, 0]
+        assert [r["provider_status"] for r in rows] == [403, 200, 200]
+        assert all(r["profile_id"] == "caller-profile" and r["profile_version"] == "1" for r in rows)
+        assert all(r["http_requests"] == 1 for r in rows)
+        assert all(r["attempted_at"] <= r["finished_at"] for r in rows)
+
+
+def test_acquisition_success_does_not_claim_failed_durable_landing(tmp_path, routes, monkeypatch):
+    def fail_sync(self, cur, item_id, now):
+        raise RuntimeError("injected durable landing failure")
+    monkeypatch.setattr(Store, "_sync_observation", fail_sync)
+    path = tmp_path / "landing-failed.db"
+    with pytest.raises(RuntimeError, match="durable landing"):
+        collect(TERMS, sources=["hackernews"], db_path=str(path))
+    with Store(path) as db:
+        first = db.coverage_page(limit=1)
+        pending = first["rows"][0]
+        assert pending["acquisition"] == "completed" and pending["landing"] == "pending"
+        assert pending["last_success_at"] is None
+        failed = db.coverage_page(cursor=first["checkpoint"])["rows"][0]
+        assert failed["attempt_id"] == pending["attempt_id"]
+        assert failed["acquisition"] == "completed" and failed["landing"] == "failed"
+        assert failed["execution"] == "failed" and failed["last_success_at"] is None
+        assert failed["returned_count"] == 1 and failed["stored_count"] is None
+        assert db.mentions() == [] and db.observation_changes()["rows"] == []
 
 
 @pytest.mark.parametrize("status", [200, 401])

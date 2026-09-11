@@ -56,20 +56,24 @@ class HackerNewsSource(Source):
         timestamps: list[int] = []
         for hit in hits:
             ts = hit.get("created_at_i")
-            if ts:
-                timestamps.append(int(ts))
+            published = None
+            if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                try:
+                    published = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    timestamps.append(int(ts))
+                except (ValueError, OverflowError, OSError):
+                    pass
             text = hit.get("title") or hit.get("story_title") or ""
             body = hit.get("comment_text") or hit.get("story_text") or ""
             normalized_body = strip_html(body)
             if query.casefold() not in f"{text} {normalized_body}".casefold():
                 continue
             object_id = hit.get("objectID")
-            created = (
-                datetime.fromtimestamp(ts, tz=timezone.utc) if ts else datetime.now(timezone.utc)
-            )
+            created = published or datetime.now(timezone.utc)
             mentions.append(
                 Mention(
                     source=self.name,
+                    source_item_id=str(object_id) if object_id is not None else None,
                     query=query,
                     author=hit.get("author"),
                     title=text or None,
@@ -78,6 +82,8 @@ class HackerNewsSource(Source):
                     if object_id
                     else hit.get("url"),
                     created_at=created,
+                    published_at=published,
+                    publication_provenance="created_at_i" if published else "unknown",
                     score=hit.get("points"),
                 )
             )
@@ -85,4 +91,4 @@ class HackerNewsSource(Source):
         if "nbPages" not in data:
             has_more = len(hits) >= min(limit, 100)
         next_cursor = str(min(timestamps)) if has_more and timestamps else None
-        return FetchPage(mentions, next_cursor)
+        return FetchPage(mentions, next_cursor, truncated=has_more)

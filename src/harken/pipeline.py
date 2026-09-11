@@ -6,13 +6,14 @@ collected and reported, and the other sources still land.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -60,6 +61,7 @@ class TrackResult:
     threshold_alerted: int = 0
     threshold_pending: int = 0
     threshold_events: list[str] = field(default_factory=list)
+    coverage: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,8 @@ class Pipeline:
         backfill: bool = False,
         pages: int = 3,
         project_id: int | None = None,
+        profile_id: str | None = None,
+        profile_version: str | None = None,
     ) -> TrackResult:
         query = query.strip()
         if not query:
@@ -99,6 +103,8 @@ class Pipeline:
             raise ValueError("at least one source must be configured")
         if not 1 <= pages <= 20:
             raise ValueError("pages must be between 1 and 20")
+        if (profile_id is None) != (profile_version is None):
+            raise ValueError("Supply profile_id and profile_version together")
         track_started = time.perf_counter()
         mode = "backfill" if backfill else "incremental"
         result = TrackResult(query=query, project_id=project_id, mode=mode)
@@ -108,8 +114,26 @@ class Pipeline:
 
         for name in source_names:
             source_started = time.perf_counter()
+            result.coverage[name] = {
+                "attempted_at": datetime.now(timezone.utc).isoformat(),
+                "profile_id": profile_id, "profile_version": profile_version,
+                "method": "backfill" if backfill else "recent_search",
+                "requested_since": None, "effective_since": None,
+                "page_limit": pages, "row_limit_per_page": self.config.per_source_limit,
+                "truncated": None, "http_requests": None, "provider_status": None,
+                "source_id": name,
+                "error_class": None,
+            }
+            if name == "rss":
+                feed_ids = ["rss:" + hashlib.sha256(url.encode()).hexdigest()
+                            for url in self.config.rss_feeds]
+                result.coverage[name].update(source_id=feed_ids[0] if len(feed_ids) == 1 else None,
+                                             source_ids=feed_ids, method="rss_feed")
+            source = None
+            source_mentions: list[Mention] = []
             source_cls = REGISTRY.get(name)
             if source_cls is None:
+                result.coverage[name].update(error_class="unsupported_source", http_requests=0)
                 result.errors[name] = "unknown source"
                 self.store.record_source_error(query, name, result.errors[name])
                 self._record_source_scan(query, name, mode, result, source_started)
@@ -119,6 +143,9 @@ class Pipeline:
                 result.by_source[name] = 0
                 result.pages_by_source[name] = 0
                 result.backfill_complete[name] = True
+                result.coverage[name].update(execution="not_attempted", http_requests=0,
+                                             reason="backfill_complete")
+                self._record_source_scan(query, name, mode, result, source_started)
                 log_event(
                     logger,
                     "source_scan_skipped",
@@ -140,9 +167,13 @@ class Pipeline:
                         state.get("incremental_since") or state.get("newest_at")
                     )
                 incremental_since = since
-                source_mentions: list[Mention] = []
+                result.coverage[name].update(
+                    requested_since=since.isoformat() if since else None,
+                    effective_since=since.isoformat() if since and name != "rss" else None,
+                )
                 next_cursor: str | None = cursor
                 page_limit = pages if backfill or state.get("newest_at") else 1
+                result.coverage[name]["page_limit"] = page_limit
                 for page_number in range(page_limit):
                     page = self._fetch_with_retries(
                         source,
@@ -153,7 +184,9 @@ class Pipeline:
                         since=since,
                     )
                     source_mentions.extend(page.mentions)
+                    result.coverage[name]["truncated"] = page.truncated
                     if page.errors:
+                        result.coverage[name]["error_class"] = "source_error"
                         result.errors[name] = "; ".join(page.errors)
                         self.store.record_source_error(query, name, result.errors[name])
                     result.pages_by_source[name] = page_number + 1
@@ -171,16 +204,21 @@ class Pipeline:
                 if backfill and name not in result.errors:
                     result.backfill_complete[name] = next_cursor is None
             except Exception as e:  # isolate per-source failures
+                result.coverage[name]["error_class"] = type(e).__name__
+                unique_mentions = list({mention.id: mention for mention in source_mentions}.values())
+                collected.extend(unique_mentions)
+                result.by_source[name] = len(unique_mentions)
                 result.errors[name] = f"{type(e).__name__}: {e}"
                 self.store.record_source_error(query, name, result.errors[name])
-                self._record_source_scan(query, name, mode, result, source_started)
+                self._record_source_scan(query, name, mode, result, source_started, adapter=source)
             else:
-                self._record_source_scan(query, name, mode, result, source_started)
+                self._record_source_scan(query, name, mode, result, source_started, adapter=source)
 
         # Analyze sentiment locally by default. The opt-in LLM path is batched,
         # strictly validated, and falls back to the lexicon without losing data.
         result.sentiment_error = self._analyze_sentiment(collected)
 
+        self.store.resolve_mentions(collected)
         existing_ids = self.store.existing_ids(query, [mention.id for mention in collected])
         new_negative = list(
             {
@@ -194,7 +232,17 @@ class Pipeline:
         result.fetched = len(collected)
         # Pre-cluster ingest: these mentions carry no theme yet, so preserve any
         # existing labels here; themes are (re)clustered and written below.
-        result.new = self.store.upsert(collected, update_theme=False)
+        try:
+            result.new = self.store.upsert(
+                collected, update_theme=False, attempts=list(result.coverage.values()),
+            )
+        except Exception as exc:
+            for coverage in result.coverage.values():
+                if coverage["landing"] == "pending":
+                    coverage.update(landing="failed", execution="failed", stored_count=None,
+                                    error_class=type(exc).__name__, error="durable_landing_failed")
+                    self.store.record_attempt(coverage)
+            raise
         for name, (mentions, next_cursor, incremental_since) in successful.items():
             self.store.record_source_success(
                 query,
@@ -233,20 +281,51 @@ class Pipeline:
         mode: str,
         result: TrackResult,
         started: float,
+        adapter=None,
     ) -> None:
         duration = max(time.perf_counter() - started, 0.0)
         error = result.errors.get(source)
         fetched = result.by_source.get(source, 0)
         pages = result.pages_by_source.get(source, 0)
         retries = result.retry_counts.get(source, 0)
-        self.store.record_source_metric(
-            source,
-            duration_seconds=duration,
-            fetched=fetched,
-            pages=pages,
-            retries=retries,
-            error=error,
+        coverage = result.coverage[source]
+        finished = datetime.now(timezone.utc)
+        if adapter is not None:
+            delay = getattr(adapter, "last_retry_after_seconds", None)
+            coverage.update(http_requests=getattr(adapter, "http_requests", None),
+                            provider_status=getattr(adapter, "last_http_status", None),
+                            retry_after_seconds=delay,
+                            next_eligible_at=(finished + timedelta(seconds=delay)).isoformat()
+                            if delay is not None else None)
+        coverage.update(
+            source=source, query=query, finished_at=finished.isoformat(),
+            execution=coverage.get("execution", "partial" if error and fetched else
+                                   "failed" if error else "completed"),
+            returned_count=(None if coverage.get("execution") == "not_attempted" else
+                            fetched if not error or fetched else None),
+            pages=pages, retries=retries, duration_seconds=duration,
+            error=(f"{coverage['error_class']} (HTTP {coverage['provider_status']})"
+                   if error and coverage["provider_status"] is not None
+                   else coverage["error_class"] if error else None),
+            completeness="partial" if error else
+            "bounded" if coverage["truncated"] else
+            "within_method" if coverage["truncated"] is False else "unknown",
         )
+        acquisition = coverage["execution"]
+        pending = acquisition in {"completed", "partial"}
+        coverage.update(acquisition=acquisition, landing="pending" if pending else "not_applicable",
+                        stored_count=None, landed_at=None,
+                        execution="partial" if pending else acquisition)
+        coverage.update(self.store.record_attempt(coverage))
+        if acquisition != "not_attempted":
+            self.store.record_source_metric(
+                source,
+                duration_seconds=duration,
+                fetched=fetched,
+                pages=pages,
+                retries=retries,
+                error=error,
+            )
         log_event(
             logger,
             "source_scan_complete",

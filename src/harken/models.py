@@ -25,12 +25,15 @@ class Sentiment(str, Enum):
 class Mention(BaseModel):
     """A single thing someone said, somewhere, that matched a tracked query.
 
-    ``id`` fingerprints the URL, or source/author/content when no URL exists.
-    The store associates this identity with each matching query separately.
+    ``id`` fingerprints source-scoped native identity, falling back to URL or
+    content. The store preserves an older canonical ID when identity can be
+    safely reconciled, and associates each matching query separately.
     """
 
     id: str = ""
     source_id: str = ""
+    source_item_id: str | None = None
+    author_id: str | None = None
     source: str  # e.g. "hackernews", "reddit", "mastodon"
     query: str  # the tracked term this mention matched
     author: str | None = None
@@ -41,7 +44,8 @@ class Mention(BaseModel):
     # created_at remains the operational ordering timestamp. Only published_at
     # with provenance establishes publication; undated RSS must stay unknown.
     published_at: datetime | None = None
-    publication_provenance: str = "source_created_at"
+    publication_provenance: str = "unknown"
+    indexed_at: datetime | None = None
     source_updated_at: datetime | None = None
     fetched_at: datetime | None = None
     body_expired: bool = False
@@ -70,11 +74,6 @@ class Mention(BaseModel):
     def model_post_init(self, __context) -> None:  # noqa: D401
         if not self.source_id:
             self.source_id = self.source
-        if self.published_at is None and self.publication_provenance == "source_created_at":
-            if self.source == "rss":
-                self.publication_provenance = "unknown"
-            else:
-                self.published_at = self.created_at
         if not self.id:
             self.id = self.compute_id()
 
@@ -85,8 +84,9 @@ class Mention(BaseModel):
         return "\n".join(parts).strip()
 
     def compute_id(self) -> str:
-        basis = self.url or f"{self.source}:{self.author}:{self.content[:200]}"
-        return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
+        basis = (f"{self.source_id}:{self.source_item_id}" if self.source_item_id
+                 else f"{self.source_id}:{self.url or self.content}")
+        return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
 def utcnow() -> datetime:

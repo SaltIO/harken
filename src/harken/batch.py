@@ -39,6 +39,7 @@ class _BatchConfig(Config):
 def collect(
     terms: list[str], *, sources: list[str], db_path: str,
     rss_feeds: list[str] | None = None,
+    profile_id: str | None = None, profile_version: str | None = None,
 ) -> list[TrackResult]:
     """Track one to three terms, preserving normal pipeline writes and errors."""
     terms = [term.strip() for term in terms]
@@ -63,7 +64,8 @@ def collect(
     configure_logging(config.log_format, config.log_level)
     pipeline = Pipeline(config)
     try:
-        return [pipeline.track(term, pages=1) for term in terms]
+        return [pipeline.track(term, pages=1, profile_id=profile_id,
+                               profile_version=profile_version) for term in terms]
     finally:
         pipeline.close()
 
@@ -73,11 +75,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--terms", nargs="+", required=True)
     parser.add_argument("--sources", default="hackernews,bluesky,rss")
     parser.add_argument("--db", required=True)
+    parser.add_argument("--profile-id")
+    parser.add_argument("--profile-version")
     parser.add_argument("--receipt", type=Path, help="Write completed batch timing and retry deadline input")
     args = parser.parse_args(argv)
     started_at = time.time()
     try:
-        results = collect(args.terms, sources=args.sources.split(","), db_path=args.db)
+        results = collect(args.terms, sources=args.sources.split(","), db_path=args.db,
+                          profile_id=args.profile_id, profile_version=args.profile_version)
         # Adapters supply sanitized numeric delay markers. Honor the longest
         # requested delay across every source and term in the batch.
         retry_after = max((

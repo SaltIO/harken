@@ -28,6 +28,7 @@ class FetchPage:
     mentions: list[Mention]
     next_cursor: str | None = None
     errors: list[str] = field(default_factory=list)
+    truncated: bool | None = None
 
 
 class Source:
@@ -47,6 +48,9 @@ class Source:
 
     def __init__(self, **options):
         self.options = options
+        self.http_requests = 0
+        self.last_http_status: int | None = None
+        self.last_retry_after_seconds: int | None = None
 
     def fetch(self, query: str, limit: int = 50) -> list[Mention]:
         raise NotImplementedError
@@ -70,7 +74,18 @@ class Source:
     def _client(self, **kwargs) -> httpx.Client:
         headers = {"User-Agent": self.options.get("user_agent") or USER_AGENT,
                    **kwargs.pop("headers", {})}
-        return httpx.Client(headers=headers, timeout=15.0, **kwargs)
+        hooks = kwargs.pop("event_hooks", {})
+        return httpx.Client(headers=headers, timeout=15.0, event_hooks={
+            "request": [self._request_sent, *hooks.get("request", [])],
+            "response": [self._response_received, *hooks.get("response", [])],
+        }, **kwargs)
+
+    def _request_sent(self, request: httpx.Request) -> None:
+        self.http_requests += 1
+
+    def _response_received(self, response: httpx.Response) -> None:
+        self.last_http_status = response.status_code
+        self.last_retry_after_seconds = retry_after_seconds(response.headers.get("Retry-After"))
 
 
 def strip_html(value: str) -> str:

@@ -714,6 +714,23 @@ def prune(
     console.print(f"[green]✓[/green] removed {deleted} mentions{scope}")
 
 
+@app.command("store-epoch")
+def store_epoch(
+    rotate: bool = typer.Option(False, "--rotate", help="Invalidate old continuations after restoring history."),
+    expected: str | None = typer.Option(None, "--expected", help="Previously inspected epoch; required for rotation."),
+    db: str | None = typer.Option(None, help="Database path (default: configured HARKEN_DB)."),
+):
+    """Inspect the store epoch, or explicitly rotate it after a history restore."""
+    if rotate and not expected:
+        raise typer.BadParameter("--rotate requires --expected with the inspected epoch")
+    with Store(db or Config().db_path) as store:
+        try:
+            epoch = store.rotate_epoch(expected) if rotate else store.store_epoch
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps({"store_epoch": epoch, "rotated": rotate}))
+
+
 @app.command("retention")
 def retain_data(
     source: str | None = typer.Option(None, help="Limit retention to this source."),
@@ -906,6 +923,9 @@ def _mention_record(mention) -> dict:
         "fetched_at": mention.fetched_at.isoformat() if mention.fetched_at else None,
         "body_expired": mention.body_expired,
         "source_id": mention.source_id,
+        "source_item_id": mention.source_item_id,
+        "author_id": mention.author_id,
+        "indexed_at": mention.indexed_at.isoformat() if mention.indexed_at else None,
         "score": mention.score,
         "sentiment": mention.sentiment.value if mention.sentiment else None,
         "sentiment_score": mention.sentiment_score,

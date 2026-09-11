@@ -150,6 +150,50 @@ def test_bluesky_page_preserves_api_cursor_and_since_boundary():
     assert page.next_cursor == "next-page"
 
 
+@pytest.mark.parametrize("published", [None, "invalid", "2026-06-01T12:00:00"])
+@respx.mock
+def test_bluesky_unknown_publication_keeps_index_time_separate(published):
+    respx.get("https://api.bsky.app/xrpc/app.bsky.feed.searchPosts").respond(200, json={
+        "posts": [{"uri": "at://did:plc:test/app.bsky.feed.post/1",
+                   "author": {"handle": "test.bsky.social", "did": "did:plc:test"},
+                   "record": {"text": "sample", "createdAt": published},
+                   "indexedAt": "2026-06-02T00:00:00Z"}]})
+    item = BlueskySource().fetch("sample")[0]
+    assert item.published_at is None and item.publication_provenance == "unknown"
+    assert item.indexed_at == datetime(2026, 6, 2, tzinfo=timezone.utc)
+    assert item.created_at == item.indexed_at
+    assert item.author_id == "did:plc:test"
+
+
+@respx.mock
+def test_bluesky_native_identity_survives_handle_and_query_changes():
+    route = respx.get("https://api.bsky.app/xrpc/app.bsky.feed.searchPosts")
+    items = []
+    for handle, query in (("old.test", "CMBS"), ("new.test", "EDGAR")):
+        route.respond(200, json={"posts": [{
+            "uri": "at://did:plc:test/app.bsky.feed.post/1",
+            "author": {"handle": handle, "did": "did:plc:test"},
+            "record": {"text": "CMBS EDGAR", "createdAt": "2026-06-01T00:00:00Z"},
+            "indexedAt": "2026-06-02T00:00:00Z"}]})
+        items.append(BlueskySource().fetch(query)[0])
+    assert items[0].id == items[1].id
+    assert items[0].source_item_id == "at://did:plc:test/app.bsky.feed.post/1"
+    assert items[0].published_at == datetime(2026, 6, 1, tzinfo=timezone.utc)
+    assert items[0].publication_provenance == "record.createdAt"
+    assert items[0].indexed_at != items[0].published_at
+    assert items[0].url == items[1].url == "https://bsky.app/profile/did:plc:test/post/1"
+
+
+@pytest.mark.parametrize("timestamp", [None, "not a timestamp", False])
+@respx.mock
+def test_hn_invalid_or_absent_publication_is_null(timestamp):
+    respx.get("https://hn.algolia.com/api/v1/search_by_date").respond(200, json={
+        "hits": [{"objectID": "123", "title": "sample", "created_at_i": timestamp}]})
+    item = HackerNewsSource().fetch("sample")[0]
+    assert item.source_item_id == "123"
+    assert item.published_at is None and item.publication_provenance == "unknown"
+
+
 def _bluesky_session(endpoint="https://test.host.bsky.network"):
     return {"accessJwt": "session-secret", "did": "did:plc:test", "didDoc": {
         "id": "did:plc:test", "service": [{"id": "#atproto_pds",

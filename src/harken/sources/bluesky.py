@@ -138,28 +138,37 @@ class BlueskySource(Source):
             handle = author.get("handle")
             uri = post.get("uri", "")
             rkey = uri.split("/")[-1] if uri else ""
-            created = _parse(post.get("indexedAt") or record.get("createdAt"))
+            published = _parse(record.get("createdAt"))
+            indexed = _parse(post.get("indexedAt"))
+            did = author.get("did")
+            native_id = uri if isinstance(uri, str) and uri.startswith("at://") else None
             mentions.append(
                 Mention(
                     source=self.name,
+                    source_item_id=native_id,
+                    author_id=did,
                     query=query,
                     author=handle,
                     title=None,
                     text=record.get("text", ""),
-                    url=f"https://bsky.app/profile/{handle}/post/{rkey}"
-                    if handle and rkey
+                    url=f"https://bsky.app/profile/{did or handle}/post/{rkey}"
+                    if (did or handle) and rkey
                     else None,
-                    created_at=created,
+                    created_at=published or indexed or datetime.now(timezone.utc),
+                    published_at=published,
+                    publication_provenance="record.createdAt" if published else "unknown",
+                    indexed_at=indexed,
                     score=post.get("likeCount"),
                 )
             )
-        return FetchPage(mentions, data.get("cursor"))
+        return FetchPage(mentions, data.get("cursor"), truncated=bool(data.get("cursor")))
 
 
-def _parse(s: str | None) -> datetime:
-    if not s:
-        return datetime.now(timezone.utc)
+def _parse(s: str | None) -> datetime | None:
+    if not isinstance(s, str) or not s:
+        return None
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        value = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return value.astimezone(timezone.utc) if value.tzinfo else None
     except ValueError:
-        return datetime.now(timezone.utc)
+        return None

@@ -33,7 +33,7 @@ from harken.models import Mention, Sentiment
 from harken.observability import configure_logging
 from harken.pipeline import Pipeline
 from harken.sources import REGISTRY
-from harken.store import Store
+from harken.store import CursorError, Store
 
 _HERE = Path(__file__).parent
 _SESSION_COOKIE = "harken_session"
@@ -204,6 +204,48 @@ def create_app(
 
     def store() -> Store:
         return Store(db_path)
+
+    @app.exception_handler(CursorError)
+    async def cursor_error(request: Request, exc: CursorError):
+        status = 400 if exc.code == "invalid_cursor" else 410 if exc.code == "cursor_expired" else 409
+        return JSONResponse({"schema_version": "harken.observations.v1",
+                             "code": exc.code, "detail": str(exc)}, status_code=status)
+
+    @app.get("/api/observations/changes")
+    def observation_changes(
+        cursor: str | None = None, source: str | None = None, query: str | None = None,
+        profile_id: str | None = None, profile_version: str | None = None,
+        limit: int = Query(200, ge=1, le=1000),
+    ):
+        if (profile_id is None) != (profile_version is None):
+            raise HTTPException(422, detail="Supply profile_id and profile_version together")
+        with store() as db:
+            return db.observation_changes(cursor=cursor, source=source, query=query,
+                                          profile_id=profile_id, profile_version=profile_version,
+                                          limit=limit)
+
+    @app.get("/api/observations/{item_id}")
+    def observation_detail(item_id: str):
+        with store() as db:
+            value = db.observation(item_id)
+            if value is None:
+                return JSONResponse({"schema_version": "harken.observations.v1",
+                                     "code": "observation_not_found", "detail": "Identity is not retained."},
+                                    status_code=404)
+            return {"schema_version": "harken.observations.v1", "store_epoch": db.store_epoch,
+                    "observation": value}
+
+    @app.get("/api/coverage")
+    def coverage(
+        cursor: str | None = None, source: str | None = None, query: str | None = None,
+        profile_id: str | None = None, profile_version: str | None = None,
+        limit: int = Query(200, ge=1, le=1000),
+    ):
+        if (profile_id is None) != (profile_version is None):
+            raise HTTPException(422, detail="Supply profile_id and profile_version together")
+        with store() as db:
+            return db.coverage_page(cursor=cursor, source=source, query=query,
+                                    profile_id=profile_id, profile_version=profile_version, limit=limit)
 
     def _csrf_valid(supplied: str) -> bool:
         # Compare as bytes so a non-ASCII submission returns False instead of
@@ -886,6 +928,9 @@ def _view(m: Mention) -> dict:
         "text": m.text,
         "url": _safe_url(m.url),
         "source_id": m.source_id,
+        "source_item_id": m.source_item_id,
+        "author_id": m.author_id,
+        "indexed_at": m.indexed_at.isoformat() if m.indexed_at else None,
         "created_at": m.created_at.isoformat(),
         "published_at": m.published_at.isoformat() if m.published_at else None,
         "publication_provenance": m.publication_provenance,

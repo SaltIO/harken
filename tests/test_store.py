@@ -1,12 +1,251 @@
 """SQLite store tests — temp DB, no network."""
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from harken.models import Mention, Sentiment
-from harken.store import Store
+from harken.store import CursorError, Store
+
+
+def test_object_changes_keep_native_identity_separate_from_matches(tmp_path):
+    path = tmp_path / "objects.db"
+    first = Mention(source="bluesky", source_item_id="at://did:plc:a/app.bsky.feed.post/1",
+                    author_id="did:plc:a", author="old.test", query="one", text="body",
+                    created_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
+    other_match = first.model_copy(update={"query": "two"})
+    with Store(path) as db:
+        db.upsert([first, other_match])
+        page = db.observation_changes()
+        assert len({r["id"] for r in page["rows"]}) == 1
+        assert len({r["revision"] for r in page["rows"]}) == 1
+        assert page["rows"][-1]["queries"] == ["one", "two"]
+        assert all("text" not in row and "title" not in row for row in page["rows"])
+        original = db.observation(first.id)
+        db.upsert([other_match])
+        assert db.observation_changes(cursor=page["checkpoint"])["rows"] == []
+        edited = first.model_copy(update={"text": "changed", "author": "new.test"})
+        db.upsert([edited])
+        change = db.observation_changes(cursor=page["checkpoint"])["rows"]
+        assert len(change) == 1 and change[0]["id"] == first.id
+        assert change[0]["revision"] != original["revision"]
+        assert change[0]["fetched_at"] == original["fetched_at"]
+        assert {m.text for m in db.mentions()} == {"changed"}
+    with Store(path) as db:
+        assert db.observation(first.id)["queries"] == ["one", "two"]
+        assert db.observation_changes(cursor=page["checkpoint"])["rows"] == change
+
+
+def test_changes_finite_upper_bound_scope_epoch_and_empty_resume(tmp_path):
+    with Store(tmp_path / "finite.db") as db:
+        baseline = db.observation_changes()
+        assert baseline["rows"] == [] and baseline["next_cursor"] is None
+        items = [mk(str(i), url=f"https://example.test/{i}") for i in range(3)]
+        db.upsert(items)
+        first = db.observation_changes(cursor=baseline["checkpoint"], limit=1)
+        assert first["has_more"]
+        db.upsert([mk("arrives after snapshot", url="https://example.test/new")])
+        second = db.observation_changes(cursor=first["next_cursor"], limit=100)
+        assert len(second["rows"]) == 2 and second["upper_seq"] == first["upper_seq"]
+        assert second["next_cursor"] is None
+        next_run = db.observation_changes(cursor=second["checkpoint"])
+        assert len(next_run["rows"]) == 1
+        with pytest.raises(CursorError, match="scope"):
+            db.observation_changes(cursor=first["checkpoint"], source="rss")
+        with pytest.raises(ValueError, match="together"):
+            db.observation_changes(profile_id="optional")
+        bound = db.observation_changes(profile_id="optional", profile_version="1")
+        assert len(bound["rows"]) == 4  # Context binding does not silently filter objects.
+        with pytest.raises(CursorError, match="scope"):
+            db.observation_changes(cursor=bound["checkpoint"], profile_id="optional", profile_version="2")
+        with Store(tmp_path / "other.db") as other:
+            with pytest.raises(CursorError) as mismatch:
+                other.observation_changes(cursor=first["checkpoint"])
+            assert mismatch.value.code == "cursor_epoch_mismatch"
+        for token in ("not-a-cursor", "!", "x" * 5000):
+            with pytest.raises(CursorError):
+                db.observation_changes(cursor=token)
+
+
+def test_failed_upsert_rolls_back_objects_matches_and_changes(tmp_path, monkeypatch):
+    with Store(tmp_path / "atomic.db") as db:
+        old = mk("old", url="https://example.test/old")
+        db.upsert([old])
+        checkpoint = db.observation_changes()["checkpoint"]
+        original = db._sync_observation
+        def fail_after_event(cur, item_id, now):
+            original(cur, item_id, now)
+            raise RuntimeError("injected failure before commit")
+        monkeypatch.setattr(db, "_sync_observation", fail_after_event)
+        with pytest.raises(RuntimeError, match="before commit"):
+            db.upsert([mk("new", url="https://example.test/new")])
+        assert len(db.mentions()) == 1
+        assert db.observation_changes(cursor=checkpoint)["rows"] == []
+        monkeypatch.setattr(db, "_sync_observation", original)
+        db.upsert([mk("new", url="https://example.test/new")])
+        assert len(db.observation_changes(cursor=checkpoint)["rows"]) == 1
+
+
+def test_expiry_and_removal_emit_scoped_body_free_changes(tmp_path):
+    with Store(tmp_path / "expiry.db") as db:
+        item = mk("sensitive body", source="rss", url="https://example.test/post")
+        db.upsert([item])
+        initial = db.observation(item.id)
+        checkpoint = db.observation_changes(query="acme")["checkpoint"]
+        first_seen = datetime.fromisoformat(initial["fetched_at"])
+        db.retention(now=first_seen + timedelta(days=31), apply=True)
+        expired = db.observation_changes(cursor=checkpoint, query="acme")
+        assert [r["availability"] for r in expired["rows"]] == ["expired"]
+        assert db.observation(item.id)["text"] is None
+        db.upsert([item.model_copy(update={"query": "new-query"})])
+        assert all(m.body_expired and not m.text for m in db.mentions())
+        latest_checkpoint = db.observation_changes(query="acme")["checkpoint"]
+        # Unprocessed history expired; an already-consumed boundary can still resume.
+        db.retention(now=first_seen + timedelta(days=122), apply=True)
+        with pytest.raises(CursorError) as expired_cursor:
+            db.observation_changes(cursor=checkpoint, query="acme")
+        assert expired_cursor.value.code == "cursor_expired"
+        assert db.observation_changes(cursor=latest_checkpoint, query="acme")["rows"][-1]["kind"] == "removed"
+        retained = db.observation_changes(query="acme")
+        assert retained["rows"][-1]["kind"] == "removed"
+        assert retained["rows"][-1]["url"] is None
+        assert db.observation(item.id)["availability"] == "removed"
+        assert "sensitive body" not in str(retained)
+
+
+def test_query_scoped_prune_delivers_membership_removal(tmp_path):
+    with Store(tmp_path / "prune.db") as db:
+        item = mk("body", url="https://example.test/1")
+        db.upsert([item, item.model_copy(update={"query": "other"})])
+        checkpoint = db.observation_changes(query="acme")["checkpoint"]
+        db.delete_before(datetime(2027, 1, 1, tzinfo=timezone.utc), query="acme")
+        rows = db.observation_changes(query="acme", cursor=checkpoint)["rows"]
+        assert len(rows) == 1 and rows[0]["queries"] == ["other"]
+        assert rows[0]["availability"] == "available"
+
+
+def test_scoped_retention_preserves_unselected_source_history(tmp_path):
+    with Store(tmp_path / "scoped.db") as db:
+        db.upsert([mk("rss body", source="rss"), mk("hn body")])
+        first = db.observation_changes(limit=1)
+        db.retention(now=datetime.now(timezone.utc) + timedelta(days=100), source="rss", apply=True)
+        remaining = db.observation_changes(cursor=first["checkpoint"])
+        assert any(r["source"] == "hackernews" for r in remaining["rows"])
+        assert len(db.mentions(source="hackernews")) == 1
+
+
+def test_explicit_epoch_rotation_invalidates_restored_history_cursors(tmp_path):
+    with Store(tmp_path / "epoch.db") as db:
+        db.upsert([mk("retained body")])
+        old = db.observation_changes()
+        with pytest.raises(CursorError):
+            db.rotate_epoch("stale expectation")
+        assert db.store_epoch == old["store_epoch"]
+        new_epoch = db.rotate_epoch(old["store_epoch"])
+        assert new_epoch != old["store_epoch"]
+        assert len(db.mentions()) == 1
+        with pytest.raises(CursorError) as mismatch:
+            db.observation_changes(cursor=old["checkpoint"])
+        assert mismatch.value.code == "cursor_epoch_mismatch"
+
+
+@pytest.mark.parametrize("source,source_id,url,native_id", [
+    ("hackernews", "hackernews", "https://news.ycombinator.com/item?id=123", "123"),
+    ("rss", "rss:known-feed", "https://example.test/post", "urn:example:guid"),
+])
+def test_legacy_migration_and_native_refetch_preserve_canonical_id(
+    tmp_path, source, source_id, url, native_id,
+):
+    path = tmp_path / "native-migration.db"
+    with sqlite3.connect(path) as old:
+        old.execute("""CREATE TABLE mentions (
+            id TEXT NOT NULL, source TEXT NOT NULL, query TEXT NOT NULL,
+            author TEXT, title TEXT, text TEXT, url TEXT, created_at TEXT NOT NULL,
+            score INTEGER, sentiment TEXT, sentiment_score REAL, theme TEXT,
+            fetched_at TEXT NOT NULL, source_id TEXT, PRIMARY KEY(id,query))""")
+        old.execute("INSERT INTO mentions(id,source,source_id,query,text,url,created_at,fetched_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)", ("retained-legacy-id", source, source_id, "acme",
+                    "old body", url, "2026-01-01T00:00:00+00:00", "2026-09-01T00:00:00+00:00"))
+    with Store(path) as db:
+        old_ref = db.observation("retained-legacy-id")
+        assert old_ref["published_at"] is None
+        if source == "hackernews":
+            assert old_ref["source_item_id"] == native_id
+        fresh = Mention(source=source, source_id=source_id, source_item_id=native_id,
+                        url=url, query="acme", text="new body", created_at=datetime.now(timezone.utc))
+        assert fresh.id != "retained-legacy-id"
+        db.resolve_mentions([fresh])
+        assert fresh.id == "retained-legacy-id"
+        assert db.upsert([fresh]) == 0
+        # The native linkage survives a display URL change and another query.
+        fresh = Mention(source=source, source_id=source_id, source_item_id=native_id,
+                        url="https://example.test/changed-display", query="second", text="edited",
+                        created_at=datetime.now(timezone.utc))
+        assert db.upsert([fresh]) == 1
+        assert {m.id for m in db.mentions()} == {"retained-legacy-id"}
+        assert db.observation(fresh.id)["fetched_at"] == old_ref["fetched_at"]
+        assert len({r["id"] for r in db.observation_changes()["rows"]}) == 1
+
+
+def test_legacy_bluesky_handle_and_unknown_rss_feed_are_not_guessed(tmp_path):
+    with Store(tmp_path / "uncertain.db") as db:
+        for source in ("bluesky", "rss"):
+            legacy = mk("old", source=source, url="https://example.test/post")
+            db.upsert([legacy])
+            fresh = Mention(source=source, source_id="rss:known-feed" if source == "rss" else source,
+                            source_item_id="native-id", url=legacy.url, query="acme", text="fresh",
+                            created_at=datetime.now(timezone.utc))
+            assert db.upsert([fresh]) == 1
+            assert db.observation(legacy.id)["identity_provenance"] == "legacy_uncertain"
+            assert fresh.id != legacy.id
+
+
+def test_identity_expiry_scrubs_recent_journal_revisions_and_keeps_cursor_removal(tmp_path):
+    with Store(tmp_path / "scrub.db") as db:
+        item = Mention(source="rss", source_id="rss:feed", source_item_id="native-private-id",
+                       query="acme", author="private-author", author_id="private-author-id",
+                       url="https://private.example/post", text="private-body",
+                       created_at=datetime.now(timezone.utc))
+        db.upsert([item])
+        first_seen = datetime.fromisoformat(db.observation(item.id)["fetched_at"])
+        db.upsert([item.model_copy(update={"text": "edited"})])
+        db.retention(now=first_seen + timedelta(days=31), source="rss", apply=True)
+        checkpoint = db.observation_changes(query="acme")["checkpoint"]
+        db.retention(now=first_seen + timedelta(days=91), source="rss", apply=True)
+        rows = db.observation_changes()["rows"]
+        assert len(rows) == 4  # Scoped retention preserves sequence history.
+        assert all(r["availability"] == "removed" for r in rows)
+        assert all(r["url"] is None and r["author"] is None and r["source_item_id"] is None for r in rows)
+        assert "private" not in json.dumps(rows)
+        assert db.observation_changes(query="acme", cursor=checkpoint)["rows"][0]["kind"] == "removed"
+        assert db.upsert([item]) == 0
+        assert db.observation(item.id)["availability"] == "removed"
+        assert db.mentions() == []
+
+
+@pytest.mark.parametrize("changed", [
+    {"source_id": "rss:other-feed", "source_ids": ["rss:other-feed"]},
+    {"profile_id": "profile", "profile_version": "2"},
+    {"method": "backfill"}, {"effective_since": "2026-01-01T00:00:00+00:00"},
+    {"row_limit_per_page": 2},
+])
+def test_attempt_last_success_requires_the_actual_scope(tmp_path, changed):
+    now = datetime.now(timezone.utc).isoformat()
+    value = {"source": "rss", "source_id": "rss:feed", "source_ids": ["rss:feed"],
+             "query": "acme", "profile_id": "profile", "profile_version": "1",
+             "method": "rss_feed", "effective_since": None, "row_limit_per_page": 1,
+             "finished_at": now, "landed_at": now, "acquisition": "completed",
+             "landing": "stored", "execution": "completed"}
+    with Store(tmp_path / "attempt-scope.db") as db:
+        good = db.record_attempt(value)
+        assert good["last_success_at"] == now
+        failed = {**value, "acquisition": "failed", "landing": "not_applicable", "execution": "failed"}
+        assert db.record_attempt(failed)["last_success_at"] == now
+        different = db.record_attempt({**failed, **changed})
+        assert different["last_success_at"] is None
+        assert different["attempt_scope_digest"] != good["attempt_scope_digest"]
 
 
 def mk(text, sentiment=None, source="hackernews", query="acme", url=None):
@@ -38,6 +277,9 @@ def test_fixed_multisource_replay_preserves_first_fetch_across_restart(tmp_path)
     for mention in batch:
         if mention.source == "rss":
             mention.source_id = "rss:stable-feed-fingerprint"
+        else:
+            mention.published_at = mention.created_at
+            mention.publication_provenance = "fixture_source_timestamp"
     with Store(path) as db:
         assert db.upsert(batch) == 4
         first = {(m.id, m.query): m.fetched_at for m in db.mentions(limit=None)}
@@ -81,7 +323,8 @@ def test_v2_migration_preserves_ambiguous_rss_dates(tmp_path):
         assert rows["rss"].published_at is None
         assert rows["rss"].publication_provenance == "legacy_unknown"
         assert rows["rss"].source_id == "rss"  # historical feed identity is unavailable
-        assert rows["hackernews"].published_at == rows["hackernews"].created_at
+        assert rows["hackernews"].published_at is None
+        assert rows["hackernews"].publication_provenance == "legacy_unknown"
         assert rows["rss"].fetched_at == datetime(2026, 9, 1, tzinfo=timezone.utc)
 
 

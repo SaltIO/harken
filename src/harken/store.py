@@ -6,11 +6,16 @@ query them back with filters, and compute the aggregates the dashboard needs.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
+import secrets
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from harken.auth import validate_role, validate_username
 from harken.models import Mention, Sentiment
@@ -35,6 +40,9 @@ CREATE TABLE mentions (
     source_updated_at TEXT,
     body_expired INTEGER NOT NULL DEFAULT 0,
     source_id TEXT NOT NULL DEFAULT '',
+    source_item_id TEXT,
+    author_id TEXT,
+    indexed_at TEXT,
     PRIMARY KEY (id, query)
 );
 """
@@ -172,7 +180,38 @@ CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
 # Bumped when the on-disk schema or a one-time reconciliation step changes.
 # Stored in `PRAGMA user_version` so _ensure_schema() can skip the expensive
 # whole-table reconciliation on every connection once a DB is up to date.
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
+
+_OBSERVATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS observation_meta (
+    key TEXT PRIMARY KEY, value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS observation_heads (
+    id TEXT PRIMARY KEY, revision TEXT NOT NULL, reference TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS observation_changes (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    changed_at TEXT NOT NULL, reference TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_attempts (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    finished_at TEXT NOT NULL, record TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mentions_native ON mentions(source_id,source_item_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_identity_url ON mentions(source_id,url);
+CREATE INDEX IF NOT EXISTS idx_observation_change_id
+    ON observation_changes(json_extract(reference,'$.id'));
+CREATE INDEX IF NOT EXISTS idx_attempt_scope
+    ON collection_attempts(json_extract(record,'$.attempt_scope_digest'),seq);
+"""
+
+
+class CursorError(ValueError):
+    """A continuation cannot be safely resumed against this store and scope."""
+
+    def __init__(self, code: str, detail: str):
+        self.code = code
+        super().__init__(detail)
 
 
 class Store:
@@ -188,6 +227,7 @@ class Store:
         if self.path != ":memory:":
             self._conn.execute("PRAGMA journal_mode = WAL")
         self._ensure_schema()
+        self._ensure_observations()
         self._conn.commit()
 
     def _ensure_schema(self) -> None:
@@ -245,15 +285,18 @@ class Store:
                 ("source_updated_at", "TEXT"),
                 ("body_expired", "INTEGER NOT NULL DEFAULT 0"),
                 ("source_id", "TEXT NOT NULL DEFAULT ''"),
+                ("source_item_id", "TEXT"),
+                ("author_id", "TEXT"),
+                ("indexed_at", "TEXT"),
             ):
                 if name not in columns:
                     cur.execute(f"ALTER TABLE mentions ADD COLUMN {name} {declaration}")
             # Historical RSS created_at may be fetched-now or updated time.
             # Never promote that ambiguous value into publication evidence.
             cur.execute(
-                "UPDATE mentions SET published_at=created_at, "
-                "publication_provenance='source_created_at' "
-                "WHERE source!='rss' AND publication_provenance='legacy_unknown'"
+                "UPDATE mentions SET published_at=NULL, "
+                "publication_provenance='legacy_unknown' "
+                "WHERE publication_provenance IN ('legacy_unknown','source_created_at')"
             )
             cur.execute("UPDATE mentions SET source_id=source WHERE source_id=''")
             cur.executescript(
@@ -283,6 +326,345 @@ class Store:
                     (DEFAULT_PROJECT_ID,),
                 )
             cur.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+
+    def _ensure_observations(self) -> None:
+        self._conn.executescript(_OBSERVATION_SCHEMA)
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            exists = self._conn.execute(
+                "SELECT value FROM observation_meta WHERE key='epoch'"
+            ).fetchone()
+            identity_ready = self._conn.execute(
+                "SELECT value FROM observation_meta WHERE key='native_identity_version'"
+            ).fetchone()
+            if exists and identity_ready:
+                return
+            if not exists:
+                self._conn.executemany(
+                    "INSERT INTO observation_meta(key,value) VALUES (?,?)",
+                    [("epoch", secrets.token_hex(16)), ("cursor_key", secrets.token_hex(32)),
+                     ("changes_floor", "0"), ("coverage_floor", "0")],
+                )
+            now = datetime.now(timezone.utc).isoformat()
+            with closing(self._conn.cursor()) as cur:
+                legacy = cur.execute(
+                    "SELECT DISTINCT id,url FROM mentions WHERE source='hackernews' "
+                    "AND source_item_id IS NULL"
+                ).fetchall()
+                for row in legacy:
+                    native_id = self._hn_native_id(row["url"])
+                    if native_id:
+                        cur.execute("UPDATE mentions SET source_item_id=? WHERE id=?",
+                                    (native_id, row["id"]))
+                ids = [r[0] for r in cur.execute("SELECT DISTINCT id FROM mentions")]
+                for item_id in ids:
+                    self._sync_observation(cur, item_id, now)
+                cur.execute("INSERT OR REPLACE INTO observation_meta(key,value) "
+                            "VALUES ('native_identity_version','1')")
+
+    @staticmethod
+    def _hn_native_id(url: str | None) -> str | None:
+        """Recover only HN's documented item identity, never a linked article ID."""
+        if not url:
+            return None
+        try:
+            parsed = urlsplit(url)
+            ids = parse_qs(parsed.query).get("id", [])
+            if (parsed.scheme in {"http", "https"} and parsed.hostname == "news.ycombinator.com"
+                    and parsed.path == "/item" and len(ids) == 1 and ids[0].isascii()
+                    and ids[0].isdigit()):
+                return ids[0]
+        except ValueError:
+            pass
+        return None
+
+    def resolve_mentions(self, mentions: list[Mention]) -> None:
+        """Preserve retained canonical IDs when a native-aware adapter replaces legacy data.
+
+        Exact URL reconciliation requires the same source scope, no conflicting
+        native identity, and (for RSS) a known feed. Bluesky handles can change
+        owners, so a legacy handle URL is never promoted to an AT identity.
+        """
+        with closing(self._conn.cursor()) as cur:
+            for mention in mentions:
+                self._resolve_mention(cur, mention)
+
+    def _resolve_mention(self, cur: sqlite3.Cursor, mention: Mention) -> None:
+        if mention.source == "hackernews" and not mention.source_item_id:
+            mention.source_item_id = self._hn_native_id(mention.url)
+        native = cur.execute(
+            "SELECT DISTINCT id,source_item_id FROM mentions WHERE source_id=? AND source_item_id=?",
+            (mention.source_id, mention.source_item_id),
+        ).fetchall() if mention.source_item_id else []
+        if not native and mention.url and mention.source != "bluesky" and (
+            mention.source != "rss" or mention.source_id.startswith("rss:")
+        ):
+            native = cur.execute(
+                "SELECT DISTINCT id,source_item_id FROM mentions WHERE source_id=? AND url=? "
+                "AND (source_item_id IS NULL OR source_item_id=?)",
+                (mention.source_id, mention.url, mention.source_item_id),
+            ).fetchall()
+        if len(native) > 1:
+            raise ValueError("Conflicting retained object identities require explicit reconciliation")
+        if native:
+            mention.id = native[0]["id"]
+            mention.source_item_id = mention.source_item_id or native[0]["source_item_id"]
+
+    def _sync_observation(self, cur: sqlite3.Cursor, item_id: str, now: str) -> None:
+        """Commit an object reference/change with the owning mutation transaction.
+
+        Query memberships stay in mentions; the head/journal never copy bodies.
+        All source fields for a live object are reconciled during upsert.
+        """
+        old = cur.execute("SELECT * FROM observation_heads WHERE id=?", (item_id,)).fetchone()
+        rows = cur.execute(
+            "SELECT * FROM mentions WHERE id=? ORDER BY fetched_at,query", (item_id,)
+        ).fetchall()
+        if rows:
+            row = rows[0]
+            evidence = {key: row[key] for key in (
+                "source", "source_id", "source_item_id", "author_id", "author", "url",
+                "title", "text", "published_at", "publication_provenance", "indexed_at",
+                "source_updated_at", "body_expired", "score",
+            )}
+            revision = hashlib.sha256(json.dumps(
+                evidence, sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest()
+            reference = {key: row[key] for key in (
+                "id", "source", "source_id", "source_item_id", "author_id", "author", "url",
+                "published_at", "publication_provenance", "indexed_at", "source_updated_at",
+            )}
+            reference.update(
+                revision=revision, queries=sorted({r["query"] for r in rows}),
+                fetched_at=row["fetched_at"],
+                availability="expired" if row["body_expired"] else "available",
+                identity_provenance="native" if row["source_item_id"] else "legacy_uncertain",
+            )
+        elif old:
+            reference = json.loads(old["reference"])
+            reference.update(availability="removed", queries=[], removed_at=now)
+            self._scrub_identity(reference)
+            # A recent edit must not extend an old identity's lifetime. Scrub
+            # every retained journal version, preserving sequence and membership
+            # references so existing continuations can still receive removals.
+            events = cur.execute("SELECT seq,reference FROM observation_changes "
+                                 "WHERE json_extract(reference,'$.id')=?", (item_id,)).fetchall()
+            for event_row in events:
+                event_reference = json.loads(event_row["reference"])
+                self._scrub_identity(event_reference)
+                cur.execute("UPDATE observation_changes SET reference=? WHERE seq=?",
+                            (json.dumps(event_reference, sort_keys=True), event_row["seq"]))
+            reference["revision"] = hashlib.sha256(
+                f"{old['revision']}:removed".encode()
+            ).hexdigest()
+        else:
+            return
+        serialized = json.dumps(reference, sort_keys=True)
+        if old and old["reference"] == serialized:
+            return
+        kind = ("removed" if not rows else "expired" if reference["availability"] == "expired"
+                else "created" if old is None else "updated")
+        event = {**reference, "kind": kind, "changed_at": now}
+        # Membership before removal is needed to deliver tombstones to scoped readers.
+        event["matched_queries"] = sorted(set(reference["queries"]) | (
+            set(json.loads(old["reference"])["queries"]) if old else set()
+        ))
+        cur.execute(
+            "INSERT INTO observation_changes(changed_at,reference) VALUES (?,?)",
+            (now, json.dumps(event, sort_keys=True)),
+        )
+        cur.execute(
+            "INSERT INTO observation_heads(id,revision,reference) VALUES (?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,reference=excluded.reference",
+            (item_id, reference["revision"], serialized),
+        )
+
+    @staticmethod
+    def _scrub_identity(reference: dict) -> None:
+        for key in ("author", "author_id", "url", "source_item_id", "published_at",
+                    "indexed_at", "source_updated_at"):
+            reference[key] = None
+        reference.update(publication_provenance="unavailable", identity_provenance="unavailable",
+                         availability="removed")
+
+    def observation(self, item_id: str) -> dict | None:
+        self._conn.execute("BEGIN")
+        try:
+            head = self._conn.execute(
+                "SELECT reference FROM observation_heads WHERE id=?", (item_id,)
+            ).fetchone()
+            if head is None:
+                return None
+            reference = json.loads(head[0])
+            row = self._conn.execute(
+                "SELECT title,text FROM mentions WHERE id=? ORDER BY fetched_at,query LIMIT 1",
+                (item_id,),
+            ).fetchone()
+            reference.update(title=row[0] if row else None, text=row[1] if row else None)
+            return reference
+        finally:
+            self._conn.rollback()
+
+    def record_attempt(self, record: dict) -> dict:
+        """Append a state revision of one attempt; the latest attempt_id wins."""
+        with self._conn, closing(self._conn.cursor()) as cur:
+            return self._insert_attempt(cur, record)
+
+    def _insert_attempt(self, cur: sqlite3.Cursor, record: dict) -> dict:
+        allowed = {
+            "source", "source_id", "source_ids", "query", "profile_id", "profile_version",
+            "method", "attempted_at", "finished_at", "requested_since", "effective_since",
+            "page_limit", "row_limit_per_page", "truncated", "http_requests", "provider_status",
+            "retry_after_seconds", "next_eligible_at", "execution", "returned_count", "pages",
+            "retries", "duration_seconds", "error", "error_class", "completeness", "reason",
+            "attempt_id", "acquisition", "landing", "landed_at", "stored_count",
+        }
+        value = {key: item for key, item in record.items() if key in allowed}
+        value.setdefault("attempt_id", secrets.token_hex(16))
+        scope = {key: value.get(key) for key in (
+            "source", "source_id", "source_ids", "query", "profile_id", "profile_version",
+            "method", "requested_since", "effective_since", "page_limit", "row_limit_per_page",
+        )}
+        if scope["source_ids"] is not None:
+            scope["source_ids"] = sorted(set(scope["source_ids"]))
+        value["attempt_scope_digest"] = hashlib.sha256(
+            json.dumps(scope, sort_keys=True).encode()
+        ).hexdigest()
+        previous = cur.execute(
+            "SELECT record FROM collection_attempts "
+            "WHERE json_extract(record,'$.attempt_scope_digest')=? ORDER BY seq DESC LIMIT 1",
+            (value["attempt_scope_digest"],),
+        ).fetchone()
+        value["last_success_at"] = (
+            value["landed_at"] if value.get("acquisition") == "completed"
+            and value.get("landing") == "stored" else
+            json.loads(previous[0]).get("last_success_at") if previous else None
+        )
+        value["recorded_at"] = datetime.now(timezone.utc).isoformat()
+        cur.execute(
+            "INSERT INTO collection_attempts(finished_at,record) VALUES (?,?)",
+            (value["recorded_at"], json.dumps(value, sort_keys=True)),
+        )
+        return value
+
+    @property
+    def store_epoch(self) -> str:
+        return self._conn.execute(
+            "SELECT value FROM observation_meta WHERE key='epoch'"
+        ).fetchone()[0]
+
+    def rotate_epoch(self, expected_epoch: str) -> str:
+        """Invalidate continuations after an operator-directed history restore."""
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if self.store_epoch != expected_epoch:
+                raise CursorError("cursor_epoch_mismatch", "Store epoch changed; inspect it before rotation.")
+            epoch = secrets.token_hex(16)
+            self._conn.executemany("UPDATE observation_meta SET value=? WHERE key=?", [
+                (epoch, "epoch"), (secrets.token_hex(32), "cursor_key"),
+            ])
+            return epoch
+
+    def _seal_cursor(self, payload: dict) -> str:
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        key = self._conn.execute(
+            "SELECT value FROM observation_meta WHERE key='cursor_key'"
+        ).fetchone()[0].encode()
+        signed = raw + hmac.new(key, raw, hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(signed).decode().rstrip("=")
+
+    def _open_cursor(self, token: str) -> dict:
+        try:
+            if len(token) > 4096:
+                raise ValueError()
+            signed = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True)
+            raw, mac = signed[:-32], signed[-32:]
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError()
+            if value.get("epoch") != self.store_epoch:
+                raise CursorError("cursor_epoch_mismatch", "Store epoch changed; select a new baseline.")
+            key = self._conn.execute(
+                "SELECT value FROM observation_meta WHERE key='cursor_key'"
+            ).fetchone()[0].encode()
+            if not hmac.compare_digest(mac, hmac.new(key, raw, hashlib.sha256).digest()):
+                raise ValueError()
+            return value
+        except CursorError:
+            raise
+        except (ValueError, TypeError, UnicodeError) as exc:
+            raise CursorError("invalid_cursor", "Invalid continuation; preserve the old checkpoint.") from exc
+
+    def observation_changes(
+        self, *, cursor: str | None = None, source: str | None = None,
+        query: str | None = None, profile_id: str | None = None,
+        profile_version: str | None = None, limit: int = 200,
+    ) -> dict:
+        return self._reference_page("changes", cursor=cursor, source=source, query=query,
+                                    profile_id=profile_id, profile_version=profile_version, limit=limit)
+
+    def coverage_page(self, **kwargs) -> dict:
+        return self._reference_page("coverage", **kwargs)
+
+    def _reference_page(
+        self, stream: str, *, cursor: str | None = None, source: str | None = None,
+        query: str | None = None, profile_id: str | None = None,
+        profile_version: str | None = None, limit: int = 200,
+    ) -> dict:
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if (profile_id is None) != (profile_version is None):
+            raise ValueError("Supply profile_id and profile_version together")
+        scope = {"stream": stream, "source": source, "query": query,
+                 "profile_id": profile_id, "profile_version": profile_version}
+        digest = hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()
+        table, column = (("observation_changes", "reference") if stream == "changes"
+                         else ("collection_attempts", "record"))
+        # A read transaction fixes epoch, horizon and page rows together.
+        with closing(self._conn.cursor()) as cur:
+            cur.execute("BEGIN")
+            try:
+                epoch = self.store_epoch
+                high = cur.execute(f"SELECT COALESCE(MAX(seq),0) FROM {table}").fetchone()[0]
+                floor = int(cur.execute(
+                    "SELECT value FROM observation_meta WHERE key=?", (f"{stream}_floor",)
+                ).fetchone()[0])
+                high = max(high, floor)
+                position = self._open_cursor(cursor) if cursor else {"after": floor, "upper": None}
+                if cursor and position.get("scope") != digest:
+                    raise CursorError("cursor_scope_mismatch", "Continuation scope differs; select a new baseline.")
+                after = position["after"]
+                upper = high if position["upper"] is None else position["upper"]
+                if after < floor:
+                    raise CursorError("cursor_expired", "Change history expired; select a bounded new baseline.")
+                if upper > high or after > upper:
+                    raise CursorError("cursor_history_gap", "Store history regressed; select a new baseline.")
+                sql = f"SELECT seq,{column} FROM {table} WHERE seq>? AND seq<=?"
+                args: list = [after, upper]
+                if source is not None:
+                    sql += f" AND json_extract({column},'$.source')=?"
+                    args.append(source)
+                if query is not None:
+                    if stream == "changes":
+                        sql += f" AND EXISTS(SELECT 1 FROM json_each({column},'$.matched_queries') WHERE value=?)"
+                    else:
+                        sql += f" AND json_extract({column},'$.query')=?"
+                    args.append(query)
+                sql += " ORDER BY seq LIMIT ?"
+                args.append(limit + 1)
+                found = cur.execute(sql, args).fetchall()
+                rows = [{**json.loads(r[1]), "seq": r[0]} for r in found[:limit]]
+                has_more = len(found) > limit
+                next_after = rows[-1]["seq"] if has_more else upper
+                payload = {"version": 1, "epoch": epoch, "scope": digest,
+                           "after": next_after, "upper": upper if has_more else None}
+                checkpoint = self._seal_cursor(payload)
+                return {"schema_version": "harken.observations.v1", "store_epoch": epoch,
+                        "scope_digest": digest, "scope": scope, "upper_seq": upper,
+                        "retained_after_seq": floor, "rows": rows, "has_more": has_more,
+                        "next_cursor": checkpoint if has_more else None, "checkpoint": checkpoint}
+            finally:
+                self._conn.rollback()
 
     def close(self) -> None:
         self._conn.close()
@@ -323,6 +705,7 @@ class Store:
         alert_where, alert_args = _before_filter(cutoff, query, table="m")
         with closing(self._conn.cursor()) as cur:
             cur.execute("BEGIN IMMEDIATE")
+            affected = [r[0] for r in cur.execute(f"SELECT DISTINCT id FROM mentions{where}", args)]
             cur.execute(
                 f"""
                 DELETE FROM alert_outbox
@@ -335,6 +718,8 @@ class Store:
             )
             cur.execute(f"DELETE FROM mentions{where}", args)
             deleted = max(cur.rowcount, 0)
+            for item_id in affected:
+                self._sync_observation(cur, item_id, datetime.now(timezone.utc).isoformat())
             self._conn.commit()
         return deleted
 
@@ -558,7 +943,10 @@ class Store:
             raise ValueError("cannot remove or demote the last active admin")
 
     # -- writes --------------------------------------------------------------
-    def upsert(self, mentions: list[Mention], *, update_theme: bool = True) -> int:
+    def upsert(
+        self, mentions: list[Mention], *, update_theme: bool = True,
+        attempts: list[dict] | None = None,
+    ) -> int:
         """Insert or replace mentions. Returns count of *new* rows.
 
         ``update_theme=False`` leaves an existing row's ``theme`` untouched. Use
@@ -569,7 +957,9 @@ class Store:
         """
         now = datetime.now(timezone.utc).isoformat()
         new = 0
-        with closing(self._conn.cursor()) as cur:
+        finalized_attempts: list[tuple[dict, dict]] = []
+        landed: dict[tuple[str, str], set[str]] = {}
+        with self._conn, closing(self._conn.cursor()) as cur:
             observed_sources: dict[str, list[str]] = {}
             for mention in mentions:
                 sources = observed_sources.setdefault(mention.query, [])
@@ -603,8 +993,9 @@ class Store:
                 INSERT INTO mentions
                     (id, source, query, author, title, text, url, created_at,
                      score, sentiment, sentiment_score, theme, fetched_at,
-                     published_at, publication_provenance, source_updated_at, source_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     published_at, publication_provenance, source_updated_at, source_id,
+                     source_item_id, author_id, indexed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id, query) DO UPDATE SET
                     source=excluded.source,
                     author=excluded.author,
@@ -618,9 +1009,19 @@ class Store:
                     published_at=excluded.published_at,
                     publication_provenance=excluded.publication_provenance,
                     source_updated_at=excluded.source_updated_at,
-                    source_id=excluded.source_id
+                    source_id=excluded.source_id,
+                    source_item_id=excluded.source_item_id,
+                    author_id=excluded.author_id,
+                    indexed_at=excluded.indexed_at
             """
             for m in mentions:
+                self._resolve_mention(cur, m)
+                head = cur.execute(
+                    "SELECT reference FROM observation_heads WHERE id=?", (m.id,)
+                ).fetchone()
+                prior = json.loads(head[0]) if head else None
+                if prior and prior["availability"] == "removed":
+                    continue  # A retained tombstone cannot resurrect an expired identity.
                 cur.execute("SELECT 1 FROM mentions WHERE id = ? AND query = ?", (m.id, m.query))
                 existed = cur.fetchone() is not None
                 cur.execute(
@@ -643,10 +1044,50 @@ class Store:
                         m.publication_provenance,
                         m.source_updated_at.isoformat() if m.source_updated_at else None,
                         m.source_id,
+                        m.source_item_id,
+                        m.author_id,
+                        m.indexed_at.isoformat() if m.indexed_at else None,
                     ),
                 )
+                expired = cur.execute(
+                    "SELECT 1 FROM mentions WHERE id=? AND body_expired=1", (m.id,)
+                ).fetchone()
+                if expired or (prior and prior["availability"] in {"expired", "removed"}):
+                    cur.execute(
+                        "UPDATE mentions SET text=NULL,title=NULL,theme=NULL,body_expired=1 WHERE id=?",
+                        (m.id,),
+                    )
+                if prior:
+                    cur.execute("UPDATE mentions SET fetched_at=? WHERE id=?",
+                                (prior["fetched_at"], m.id))
+                # An object edit applies to all query memberships. The query-specific
+                # theme remains separate and is not part of the source revision.
+                object_fields = (
+                    "source", "source_id", "source_item_id", "author_id", "author", "url",
+                    "title", "text", "created_at", "published_at", "publication_provenance",
+                    "indexed_at", "source_updated_at", "score", "sentiment", "sentiment_score",
+                )
+                names = ",".join(object_fields)
+                cur.execute(
+                    f"UPDATE mentions SET ({names})=(SELECT {names} FROM mentions WHERE id=? AND query=?) "
+                    "WHERE id=? AND query!=?", (m.id, m.query, m.id, m.query),
+                )
+                self._sync_observation(cur, m.id, now)
+                landed.setdefault((m.source, m.query), set()).add(m.id)
                 if not existed:
                     new += 1
+            # The landing receipt commits with bodies, matches and changes. A
+            # reader can never see a stored receipt without its durable evidence.
+            for attempt in attempts or []:
+                if attempt["landing"] == "pending":
+                    final = self._insert_attempt(cur, {
+                        **attempt, "landing": "stored", "landed_at": now,
+                        "stored_count": len(landed.get((attempt["source"], attempt["query"]), set())),
+                        "execution": attempt["acquisition"],
+                    })
+                    finalized_attempts.append((attempt, final))
+        for attempt, final in finalized_attempts:
+            attempt.update(final)
         self._conn.commit()
         return new
 
@@ -685,6 +1126,10 @@ class Store:
                     ).fetchone()[0],
                 }
                 if apply:
+                    affected = [r[0] for r in cur.execute(
+                        "SELECT DISTINCT id FROM mentions WHERE fetched_at<?" + scope,
+                        [body_cutoff, *source_args],
+                    )]
                     # Threshold payloads may quote multiple sources. They have
                     # no item-level provenance, so discard the affected query's
                     # payloads rather than retain an expired body indirectly.
@@ -704,6 +1149,35 @@ class Store:
                         "UPDATE mentions SET text=NULL,title=NULL,theme=NULL,body_expired=1 "
                         "WHERE fetched_at<? AND body_expired=0" + scope,
                         [body_cutoff, *source_args],
+                    )
+                    for item_id in affected:
+                        if cur.execute("SELECT 1 FROM mentions WHERE id=? AND body_expired=1",
+                                       (item_id,)).fetchone():
+                            cur.execute("UPDATE mentions SET text=NULL,title=NULL,theme=NULL,body_expired=1 "
+                                        "WHERE id=?", (item_id,))
+                        self._sync_observation(cur, item_id, now.astimezone(timezone.utc).isoformat())
+                    for stream, table, time_column in (
+                        ("changes", "observation_changes", "changed_at"),
+                        ("coverage", "collection_attempts", "finished_at"),
+                    ):
+                        # A source-scoped action must not erase another source's
+                        # history or advance the global continuation floor.
+                        if source is not None:
+                            continue
+                        floor = cur.execute(
+                            f"SELECT COALESCE(MAX(seq),0) FROM {table} WHERE {time_column}<?",
+                            (identity_cutoff,),
+                        ).fetchone()[0]
+                        if floor:
+                            cur.execute(f"DELETE FROM {table} WHERE seq<=?", (floor,))
+                            cur.execute(
+                                "UPDATE observation_meta SET value=? WHERE key=?",
+                                (str(floor), f"{stream}_floor"),
+                            )
+                    cur.execute(
+                        "DELETE FROM observation_heads WHERE json_extract(reference,'$.removed_at')<?"
+                        + (" AND json_extract(reference,'$.source')=?" if source else ""),
+                        [identity_cutoff, *source_args],
                     )
                     self._conn.commit()
                 return counts
@@ -1570,6 +2044,9 @@ def _row_to_mention(r: sqlite3.Row) -> Mention:
         fetched_at=datetime.fromisoformat(r["fetched_at"]),
         body_expired=bool(r["body_expired"]),
         source_id=r["source_id"],
+        source_item_id=r["source_item_id"],
+        author_id=r["author_id"],
+        indexed_at=datetime.fromisoformat(r["indexed_at"]) if r["indexed_at"] else None,
         score=r["score"],
         sentiment=Sentiment(r["sentiment"]) if r["sentiment"] else None,
         sentiment_score=r["sentiment_score"],

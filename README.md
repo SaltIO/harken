@@ -42,9 +42,123 @@ uv run harken retention --db harken.db
 Set `HARKEN_RSS_FEEDS` to exactly one feed for the batch command. The caller
 owns scheduling and locking, and must honor the receipt's `retry_after_seconds`
 before another batch. The API's `/api/mentions/page` accepts source/query/time
-filters and returns a stable three-part cursor. Undated RSS publication remains
-null; `created_at` alone is an operational ordering time, not publication proof.
+filters and returns a stable three-part first-ingestion cursor. Use the observation
+change stream below for edits and removals. Undated publication remains null;
+`created_at` alone is an operational ordering time, not publication proof.
 The original quickstart and wider adapter interface are documented below.
+
+### Observation and coverage API (fork)
+
+These reads query the local store and make no source requests. A profile, outcome,
+case, or relevance classification is not required. Optional batch flags
+`--profile-id NAME --profile-version VERSION` record caller context without adding
+business policy. The existing authentication and read-only settings also protect
+these routes.
+
+| Route | Result |
+|---|---|
+| `GET /api/observations/changes` | Metadata changes, query matches, edits, expiry and removal events |
+| `GET /api/observations/{id}` | Current reference and available `title`/`text`; unavailable bodies are null |
+| `GET /api/coverage` | Source/query acquisition and durable landing attempt revisions, with resource counts |
+
+Both paged routes accept `limit` (1–1000, default 200), `cursor`, `source`, `query`,
+and an optional paired `profile_id`/`profile_version`. Profile fields bind the
+continuation's context; they do not silently filter stored objects or attempts.
+For example, `GET /api/observations/changes?source=bluesky&limit=100` returns:
+
+```json
+{
+  "schema_version": "harken.observations.v1",
+  "store_epoch": "store-generation",
+  "scope_digest": "scope-digest",
+  "scope": {"stream": "changes", "source": "bluesky", "query": null,
+            "profile_id": null, "profile_version": null},
+  "upper_seq": 12,
+  "retained_after_seq": 0,
+  "rows": [],
+  "has_more": false,
+  "next_cursor": null,
+  "checkpoint": "opaque-signed-continuation"
+}
+```
+
+Each change row has a monotonic `seq`, `kind`, stable `id`, evidence `revision`,
+`source`, `source_id`, native `source_item_id` and `author_id` when known,
+`identity_provenance`, display `url`/`author`, nullable `published_at` and its
+`publication_provenance`, separate `indexed_at`/`source_updated_at`, immutable
+first-ingestion `fetched_at`, `changed_at`, `availability`, current `queries`, and
+`matched_queries` needed to deliver removals to scoped readers. Bodies and titles
+are never copied into the journal. Query membership changes do not change an
+unchanged evidence revision. Detail reads return the current revision, which may
+be newer than the event; callers must compare it before attaching evidence or
+annotations. An unknown or fully expired ID returns `observation_not_found` (404).
+
+Bluesky identities use the source AT URI and author DID, independent of display
+handle. Publication comes only from a valid timezone-aware `record.createdAt`;
+`indexedAt` remains separate. HN publication comes from a valid `created_at_i`.
+RSS preserves source publication/update provenance. Migration preserves existing
+internal IDs: canonical HN item URLs can establish native IDs, and an exact RSS
+URL can reconcile a newly available GUID only inside the same known feed.
+Historical Bluesky handle URLs and unknown RSS feed identities remain
+`legacy_uncertain`; the migration cannot establish their native identity.
+
+Follow `next_cursor` until `has_more` is false, preserving the same scope. The
+first page fixes `upper_seq`, so concurrent writes wait for the next run. Commit
+each page with its `checkpoint` only after accepting that page durably. At the
+end of the finite range, `checkpoint` resumes later changes, including late edits
+to old publications. Cursors are opaque and signed; do not construct them from
+timestamps. Repeated reads at the same cursor repeat the same sequence range.
+Retention may remove metadata or make its detail unavailable during a replay.
+
+Coverage uses stable `attempt_id` and append-only state revisions; the greatest
+`seq` for each attempt is current. Count HTTP requests and other resources once
+per attempt, using that latest revision. `acquisition` records
+`completed|partial|failed|not_attempted`; `landing` independently records
+`pending|stored|failed|not_applicable`. A crash can leave an honest pending landing.
+The stored revision commits atomically with the collected rows and observation
+changes. `execution` is partial while landing is pending and failed if landing
+fails. `returned_count: 0` means a successful empty acquisition; a failed or
+unattempted acquisition has null. `stored_count`, `landed_at`, actual
+`http_requests`, `pages`, `retries`, status/backoff, bounds, window, method,
+`truncated` and `completeness` distinguish storage, healthy zero, bounded results,
+and unavailable coverage. Unmeasured counts remain null. Shared RSS cache reads
+can return matches with zero new HTTP requests. `attempt_scope_digest` binds the
+actual source/feed set, query, profile pair, method, window and limits;
+`last_success_at` only inherits a completed acquisition and stored landing in
+that exact scope. The older aggregate source metrics describe acquisition only.
+
+Invalid continuations return `invalid_cursor` (400); scope, epoch or history
+regression returns `cursor_scope_mismatch`, `cursor_epoch_mismatch`, or
+`cursor_history_gap` (409); expired history returns `cursor_expired` (410).
+Errors include `schema_version`, `code`, and `detail`. Invalid limits or an
+unpaired profile context return 422. Preserve the previous checkpoint on errors
+and explicitly select a bounded new baseline when history or scope changes.
+
+Retention remains preview-first: `harken retention --db PATH` shows the proposed
+30-day body and 90-day identity expiry measured from first ingestion. Explicit
+`--yes` applies it. Identity expiry also scrubs identifying metadata from retained
+older journal entries, including recent edits, while preserving minimal IDs,
+revisions and query references for removal delivery. Removed IDs cannot restore
+their evidence while their tombstone remains. Global retention also prunes
+90-day change/attempt history and removed tombstones and advances the continuation
+horizon. Source-scoped retention never prunes another source's history; use an
+explicit global retention run to bound the shared journal.
+
+For a host move, stop collection and serving, take a verified consistent backup,
+copy it with the configuration, then start the new host. Preserve the store epoch
+when moving the same complete history. When intentionally restoring an older
+backup, rotate its epoch before starting readers to prevent silent cursor reuse:
+
+```bash
+uv run harken store-epoch --db restored.db
+uv run harken store-epoch --db restored.db --rotate --expected INSPECTED_EPOCH
+```
+
+Rotation changes only the store generation and cursor signing key. It preserves
+the observations and invalidates old continuations. Never rotate a live store
+merely to repair a scope error. For this deployment's pinned controller, exact
+stop/start/move commands live in the sibling
+[cins Harken runbook](../cmdrvl-gtm/deploy/harken/README.md).
 
 Brand-monitoring tools like Brand24 and Mention are capable — and closed, cloud-only, and now priced in the **hundreds of dollars per month**. They ingest everything you track into their servers. For indie founders, OSS maintainers, and privacy-conscious teams, that's often backwards.
 

@@ -19,6 +19,23 @@ from harken.store import Store
 runner = CliRunner()
 
 
+def test_store_epoch_requires_matching_restore_precondition(tmp_path):
+    path = tmp_path / "epoch.db"
+    initial = runner.invoke(cli.app, ["store-epoch", "--db", str(path)])
+    assert initial.exit_code == 0, initial.output
+    inspected = json.loads(initial.output)
+    assert not inspected["rotated"]
+    for args in (["--rotate"], ["--rotate", "--expected", "stale"]):
+        refused = runner.invoke(cli.app, ["store-epoch", "--db", str(path), *args])
+        assert refused.exit_code == 2
+        with Store(path) as db:
+            assert db.store_epoch == inspected["store_epoch"]
+    rotated = runner.invoke(cli.app, ["store-epoch", "--db", str(path), "--rotate",
+                                     "--expected", inspected["store_epoch"]])
+    assert rotated.exit_code == 0, rotated.output
+    assert json.loads(rotated.output)["store_epoch"] != inspected["store_epoch"]
+
+
 def test_retention_defaults_to_preview_and_export_preserves_provenance(tmp_path, monkeypatch):
     path = tmp_path / "retention.db"
     with Store(path) as db:

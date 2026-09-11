@@ -82,6 +82,43 @@ def test_mention_page_stable_ties_filters_and_provenance(tmp_path):
         assert client.get("/api/mentions/page", params=invalid).status_code == 422
 
 
+def test_observation_api_raw_reads_changes_and_scope_errors(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Read API must never construct a collector")
+    monkeypatch.setattr("harken.web.app.Pipeline", forbidden)
+    path = seeded_db(tmp_path)
+    client = TestClient(create_app(path, config=Config(read_only=True)))
+    first = client.get("/api/observations/changes", params={"limit": 1}).json()
+    assert first["schema_version"] == "harken.observations.v1"
+    assert first["has_more"] and first["scope"]["profile_id"] is None
+    item = client.get(f"/api/observations/{first['rows'][0]['id']}")
+    assert item.status_code == 200
+    assert item.json()["observation"]["revision"] == first["rows"][0]["revision"]
+    assert item.json()["observation"]["text"]
+    assert "text" not in first["rows"][0]
+    mismatch = client.get("/api/observations/changes", params={
+        "cursor": first["checkpoint"], "source": "rss"})
+    assert mismatch.status_code == 409 and mismatch.json()["code"] == "cursor_scope_mismatch"
+    assert client.get("/api/observations/changes", params={"cursor": "bad"}).status_code == 400
+    assert client.get("/api/observations/changes", params={"profile_id": "unpaired"}).status_code == 422
+    assert client.get("/api/observations/missing").json()["code"] == "observation_not_found"
+    assert client.get("/api/coverage").json()["rows"] == []
+    assert client.post("/api/track", json={"query": "no network"}).status_code == 405
+
+
+def test_observation_api_epoch_mismatch_and_expired_horizon(tmp_path):
+    path = seeded_db(tmp_path)
+    client = TestClient(create_app(path))
+    first = client.get("/api/observations/changes", params={"limit": 1}).json()
+    other = TestClient(create_app(str(tmp_path / "new-store.db")))
+    mismatch = other.get("/api/observations/changes", params={"cursor": first["checkpoint"]})
+    assert mismatch.status_code == 409 and mismatch.json()["code"] == "cursor_epoch_mismatch"
+    with Store(path) as db:
+        db.retention(now=datetime.now(timezone.utc) + timedelta(days=100), apply=True)
+    expired = client.get("/api/observations/changes", params={"cursor": first["checkpoint"]})
+    assert expired.status_code == 410 and expired.json()["code"] == "cursor_expired"
+
+
 
 def account_client(tmp_path, role="admin"):
     db_path = str(tmp_path / f"accounts-{role}.db")
