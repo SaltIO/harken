@@ -122,6 +122,25 @@ def test_email_delivery_settings_are_loaded(monkeypatch):
     assert (cfg.smtp_username, cfg.smtp_password) == ("mailer", "secret")
 
 
+def test_bluesky_credentials_are_routed_and_not_in_repr(monkeypatch):
+    monkeypatch.setenv("HARKEN_BLUESKY_HANDLE", "test.bsky.social")
+    monkeypatch.setenv("HARKEN_BLUESKY_APP_PASSWORD", "app-password-secret")
+    cfg = config.Config()
+    assert cfg.source_options("bluesky") == {
+        "handle": "test.bsky.social", "app_password": "app-password-secret"}
+    assert "app-password-secret" not in repr(cfg)
+    assert "test.bsky.social" not in repr(cfg)
+
+
+@pytest.mark.parametrize("name", ["HARKEN_BLUESKY_HANDLE", "HARKEN_BLUESKY_APP_PASSWORD"])
+def test_bluesky_partial_credentials_rejected(monkeypatch, name):
+    monkeypatch.delenv("HARKEN_BLUESKY_HANDLE", raising=False)
+    monkeypatch.delenv("HARKEN_BLUESKY_APP_PASSWORD", raising=False)
+    monkeypatch.setenv(name, "secret")
+    with pytest.raises(ValueError, match="must be set together"):
+        config.Config()
+
+
 def test_llm_sentiment_is_explicitly_opt_in(monkeypatch):
     monkeypatch.setenv("HARKEN_SENTIMENT_ANALYZER", "llm")
     assert config.Config().sentiment_analyzer == "llm"

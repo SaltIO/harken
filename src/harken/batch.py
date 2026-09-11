@@ -25,11 +25,14 @@ class _BatchConfig(Config):
     # Shared by the fresh RSS adapter constructed for each Pipeline.track call.
     # The cache is scoped to this invocation, including failed feed responses.
     _rss_cache: dict = field(default_factory=dict, init=False, repr=False)
+    _bluesky_cache: dict = field(default_factory=dict, init=False, repr=False)
 
     def source_options(self, name: str) -> dict:
         options = super().source_options(name)
         if name == "rss":
             options["batch_cache"] = self._rss_cache
+        if name == "bluesky":
+            options["batch_cache"] = self._bluesky_cache
         return options
 
 
@@ -75,12 +78,13 @@ def main(argv: list[str] | None = None) -> int:
     started_at = time.time()
     try:
         results = collect(args.terms, sources=args.sources.split(","), db_path=args.db)
-        # RSS errors contain only adapter-generated, sanitized descriptors. Keep
-        # the longest server delay across terms sharing that one feed response.
+        # Adapters supply sanitized numeric delay markers. Honor the longest
+        # requested delay across every source and term in the batch.
         retry_after = max((
             int(match.group(1)) for result in results
+            for error in result.errors.values()
             for match in re.finditer(
-                r"\bretry_after_seconds=(\d+)(?=$|[\s;])", result.errors.get("rss", "")
+                r"\bretry_after_seconds=(\d+)(?=$|[\s;])", error
             )
         ), default=0)
         receipt = {"started_at": started_at, "finished_at": time.time(),

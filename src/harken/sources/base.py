@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import html
+import math
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -74,3 +77,23 @@ def strip_html(value: str) -> str:
     """Turn the small HTML fragments returned by feeds into readable text."""
     without_tags = re.sub(r"<[^>]+>", " ", value or "")
     return re.sub(r"\s+", " ", html.unescape(without_tags)).strip()
+
+
+def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> int | None:
+    """Normalize retry delays without logging arbitrary header text."""
+    if value is None:
+        return None
+    try:
+        seconds = Decimal(value.strip())
+    except InvalidOperation:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            delay = (date - (now or datetime.now(timezone.utc))).total_seconds()
+            seconds = Decimal(str(max(0.0, delay)))
+        except (ValueError, TypeError, OverflowError):
+            return None
+    if not seconds.is_finite() or seconds < 0 or not math.isfinite(float(seconds)):
+        return None
+    return int(seconds.to_integral_value(rounding=ROUND_CEILING))

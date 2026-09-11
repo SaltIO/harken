@@ -6,18 +6,15 @@ Filters feed entries to those mentioning the query. Configure feeds via
 
 from __future__ import annotations
 
-import math
 from calendar import timegm
 from datetime import datetime, timezone
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
-from email.utils import parsedate_to_datetime
 from hashlib import sha256
 
 import feedparser
 import httpx
 
 from harken.models import Mention
-from harken.sources.base import FetchPage, Source, strip_html
+from harken.sources.base import FetchPage, Source, retry_after_seconds, strip_html
 
 
 class RSSSource(Source):
@@ -97,7 +94,7 @@ class RSSSource(Source):
             ) else ""
             retry = None
             if isinstance(exc, httpx.HTTPStatusError):
-                retry = _retry_after_seconds(exc.response.headers.get("Retry-After"))
+                retry = retry_after_seconds(exc.response.headers.get("Retry-After"))
             marker = f" retry_after_seconds={retry}" if retry is not None else ""
             return None, f"{type(exc).__name__}{status}{marker}"
         parsed = feedparser.parse(resp.content)
@@ -123,23 +120,3 @@ def _entry_date(entry, key: str) -> datetime | None:
         # feedparser's struct_time is UTC, not the host's local timezone.
         return datetime.fromtimestamp(timegm(value), tz=timezone.utc)
     return None
-
-
-def _retry_after_seconds(value: str | None, *, now: datetime | None = None) -> int | None:
-    """Normalize a retry delay without logging arbitrary header text or capping it."""
-    if value is None:
-        return None
-    try:
-        seconds = Decimal(value.strip())
-    except InvalidOperation:
-        try:
-            date = parsedate_to_datetime(value)
-            if date.tzinfo is None:
-                date = date.replace(tzinfo=timezone.utc)
-            delay = (date - (now or datetime.now(timezone.utc))).total_seconds()
-            seconds = Decimal(str(max(0.0, delay)))
-        except (ValueError, TypeError, OverflowError):
-            return None
-    if not seconds.is_finite() or seconds < 0 or not math.isfinite(float(seconds)):
-        return None
-    return int(seconds.to_integral_value(rounding=ROUND_CEILING))

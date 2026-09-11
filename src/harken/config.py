@@ -142,6 +142,12 @@ class Config:
     )
     llm_provider: str = field(default_factory=lambda: os.getenv("HARKEN_LLM_PROVIDER", "none"))
     # source-specific options
+    bluesky_handle: str | None = field(
+        default_factory=lambda: _clean_env("HARKEN_BLUESKY_HANDLE"), repr=False
+    )
+    bluesky_app_password: str | None = field(
+        default_factory=lambda: _clean_env("HARKEN_BLUESKY_APP_PASSWORD"), repr=False
+    )
     mastodon_instance: str = field(
         default_factory=lambda: os.getenv("HARKEN_MASTODON_INSTANCE", "mastodon.social")
     )
@@ -211,6 +217,10 @@ class Config:
     session_secure: bool = field(default_factory=lambda: _bool_env("HARKEN_SESSION_SECURE", False))
 
     def __post_init__(self) -> None:
+        if bool(self.bluesky_handle) != bool(self.bluesky_app_password):
+            raise ValueError(
+                "HARKEN_BLUESKY_HANDLE and HARKEN_BLUESKY_APP_PASSWORD must be set together"
+            )
         if self.user_agent is not None and (
             not self.user_agent.isascii()
             or any(ord(char) < 32 or ord(char) == 127 for char in self.user_agent)
@@ -243,6 +253,8 @@ class Config:
             )
 
     def source_options(self, name: str) -> dict:
+        if name == "bluesky":
+            return {"handle": self.bluesky_handle, "app_password": self.bluesky_app_password}
         if name == "mastodon":
             return {
                 "instance": self.mastodon_instance,

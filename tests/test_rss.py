@@ -9,7 +9,8 @@ import respx
 
 from harken.config import Config
 from harken.pipeline import Pipeline
-from harken.sources.rss import RSSSource, _entry_time, _retry_after_seconds
+from harken.sources.base import retry_after_seconds
+from harken.sources.rss import RSSSource, _entry_time
 
 _FEED_A = """<?xml version="1.0"?>
 <rss version="2.0"><channel>
@@ -228,7 +229,7 @@ def test_rss_source_identity_is_stable_per_feed_without_url_credentials():
     ("999999999999999999999", 999999999999999999999),
 ])
 def test_retry_after_preserves_long_delays_and_rejects_invalid(value, expected):
-    assert _retry_after_seconds(value, now=datetime(2026, 9, 10, 12, tzinfo=timezone.utc)) == expected
+    assert retry_after_seconds(value, now=datetime(2026, 9, 10, 12, tzinfo=timezone.utc)) == expected
 
 
 @respx.mock

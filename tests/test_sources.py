@@ -150,6 +150,81 @@ def test_bluesky_page_preserves_api_cursor_and_since_boundary():
     assert page.next_cursor == "next-page"
 
 
+def _bluesky_session(endpoint="https://test.host.bsky.network"):
+    return {"accessJwt": "session-secret", "did": "did:plc:test", "didDoc": {
+        "id": "did:plc:test", "service": [{"id": "#atproto_pds",
+            "type": "AtprotoPersonalDataServer", "serviceEndpoint": endpoint}]}}
+
+
+@respx.mock
+def test_bluesky_authenticates_once_and_proxies_three_terms():
+    login = respx.post("https://bsky.social/xrpc/com.atproto.server.createSession").respond(
+        200, json=_bluesky_session())
+    search = respx.get("https://test.host.bsky.network/xrpc/app.bsky.feed.searchPosts").respond(
+        200, json={"posts": [], "cursor": "next"})
+    source = BlueskySource(handle="test.bsky.social", app_password="password-secret")
+    for term in ["CMBS", "EDGAR", "ABS-EE"]:
+        assert source.fetch_page(term).next_cursor == "next"
+    assert login.call_count == 1
+    assert search.call_count == 3
+    for call in search.calls:
+        assert call.request.headers["authorization"] == "Bearer session-secret"
+        assert call.request.headers["atproto-proxy"] == "did:web:api.bsky.app#bsky_appview"
+    assert "authorization" not in login.calls[0].request.headers
+
+
+@pytest.mark.parametrize("endpoint", ["http://test.host.bsky.network", "https://localhost",
+    "https://bsky.social.evil.example", "https://user:secret@bsky.social",
+    "https://test.host.bsky.network/path", "https://bsky.social?secret=value",
+    "https://bsky.social:bad", "https://bsky.social\n", None])
+@respx.mock
+def test_bluesky_rejects_unsafe_pds_without_echoing_session(endpoint):
+    respx.post("https://bsky.social/xrpc/com.atproto.server.createSession").respond(
+        200, json=_bluesky_session(endpoint))
+    source = BlueskySource(handle="test.bsky.social", app_password="password-secret")
+    with pytest.raises(RuntimeError) as caught:
+        source.fetch("CMBS")
+    assert str(caught.value) == "Bluesky login failed; check the handle and app password"
+    assert len(respx.calls) == 1
+
+
+@pytest.mark.parametrize("payload", [{}, [], {"accessJwt": "bad\ntoken"},
+                                      {"accessJwt": "secret", "did": None, "didDoc": {}}])
+@respx.mock
+def test_bluesky_rejects_malformed_session(payload):
+    respx.post("https://bsky.social/xrpc/com.atproto.server.createSession").respond(
+        200, json=payload)
+    with pytest.raises(RuntimeError, match="Bluesky login failed"):
+        BlueskySource(handle="test.bsky.social", app_password="secret").fetch("CMBS")
+
+
+@respx.mock
+def test_bluesky_failed_login_is_cached_and_redacted():
+    login = respx.post("https://bsky.social/xrpc/com.atproto.server.createSession").respond(
+        401, text="password-secret session-secret")
+    source = BlueskySource(handle="test.bsky.social", app_password="password-secret")
+    for term in ["CMBS", "EDGAR", "ABS-EE"]:
+        with pytest.raises(RuntimeError) as caught:
+            source.fetch(term)
+        assert str(caught.value) == "Bluesky login failed (HTTP 401)"
+    assert login.call_count == 1
+
+
+@respx.mock
+def test_bluesky_search_error_drops_credentials_but_keeps_backoff():
+    respx.post("https://bsky.social/xrpc/com.atproto.server.createSession").respond(
+        200, json=_bluesky_session())
+    respx.get("https://test.host.bsky.network/xrpc/app.bsky.feed.searchPosts").respond(
+        429, text="session-secret", headers={"Retry-After": "60"})
+    source = BlueskySource(handle="test.bsky.social", app_password="password-secret")
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        source.fetch("CMBS")
+    assert str(caught.value) == "Bluesky search failed (HTTP 429) retry_after_seconds=60"
+    assert "authorization" not in caught.value.request.headers
+    assert caught.value.response.text == ""
+    assert caught.value.response.headers["Retry-After"] == "60"
+
+
 @respx.mock
 def test_reddit_can_get_an_app_only_oauth_token():
     token = respx.post("https://www.reddit.com/api/v1/access_token").mock(

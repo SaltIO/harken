@@ -246,7 +246,7 @@ Only ✅ items are **built today**. 🚧 = on the [roadmap](#roadmap).
 | Source | Zero-config | Notes |
 |--------|:-----------:|-------|
 | Hacker News | ✅ | Public Algolia API — no key; service limit is 10,000 requests/hour/IP. |
-| Bluesky | ✅ | Public AT Protocol AppView search — no key. |
+| Bluesky | ✅ | Public AppView search, or authenticated PDS search when public search is blocked. |
 | Stack Overflow | ✅ | Public Stack Exchange question search; Harken preserves API backoff and anonymous quota state. |
 | X / Twitter | needs bearer token | X API v2 recent-post search; requires an X developer plan that includes recent search. |
 | YouTube | needs API key | YouTube Data API v3 video search, ordered by publication time; provider quota applies. |
@@ -272,6 +272,7 @@ Everything is optional and has a sane default — see [`.env.example`](.env.exam
 | `HARKEN_SENTIMENT_ANALYZER` | `lexicon` | Transparent local `lexicon` or explicitly opt-in batched `llm`. |
 | `HARKEN_RSS_FEEDS` | — | Comma-separated feed URLs. |
 | `HARKEN_USER_AGENT` | Harken project User-Agent | Optional printable ASCII HTTP User-Agent, including your operator contact URL/email. |
+| `HARKEN_BLUESKY_HANDLE` / `HARKEN_BLUESKY_APP_PASSWORD` | — | Optional full handle and app password for a Bluesky-hosted account; set both together. |
 | `HARKEN_X_BEARER_TOKEN` | — | App-only bearer token for X API v2 recent search. |
 | `HARKEN_YOUTUBE_API_KEY` | — | API key for YouTube Data API v3 video search. |
 | `HARKEN_WEBHOOK_URL` | — | Generic or Slack webhook for mention and threshold alerts. |
@@ -291,6 +292,8 @@ Everything is optional and has a sane default — see [`.env.example`](.env.exam
 | `HARKEN_SESSION_SECURE` | `false` | Set `true` when account mode is served through HTTPS. |
 
 Reddit accepts `HARKEN_REDDIT_CLIENT_ID` plus `HARKEN_REDDIT_CLIENT_SECRET`, or an existing `HARKEN_REDDIT_ACCESS_TOKEN`. Mastodon accepts `HARKEN_MASTODON_ACCESS_TOKEN`. See [`.env.example`](.env.example) for the full set.
+
+Bluesky public search may return 403 even when public profile lookup works. For authenticated search, create an app password in [Bluesky settings](https://bsky.app/settings/app-passwords), leaving direct-message access off. Set `HARKEN_BLUESKY_HANDLE` to the full handle (for example, `example.bsky.social`) and `HARKEN_BLUESKY_APP_PASSWORD` to that password in your private environment. Do not commit credentials. Harken logs in once per source instance through `bsky.social`, then proxies read-only search through the PDS returned by the session. The login path supports Bluesky-hosted accounts only; custom PDS hosts are rejected. Sessions stay in memory and failed logins are not repeated for each term in a batch. See the official [authentication](https://atproto.com/guides/sdk-auth) and [API routing](https://bsky.network/docs/api-directory/) documentation.
 
 X accepts `HARKEN_X_BEARER_TOKEN`; YouTube accepts `HARKEN_YOUTUBE_API_KEY`. Both adapters support incremental time boundaries and persisted pagination cursors. Harken never logs either credential. See the official [X recent-search documentation](https://docs.x.com/x-api/posts/search/integrate/overview) and [YouTube `search.list` reference](https://developers.google.com/youtube/v3/docs/search/list) for access and quota requirements.
 

@@ -63,6 +63,27 @@ def test_sequential_batch_fetches_feed_once_and_stores_each_query(tmp_path, rout
         store.close()
 
 
+@pytest.mark.parametrize("status", [200, 401])
+@respx.mock
+def test_batch_shares_bluesky_login_success_or_failure(tmp_path, monkeypatch, status):
+    monkeypatch.setenv("HARKEN_BLUESKY_HANDLE", "test.bsky.social")
+    monkeypatch.setenv("HARKEN_BLUESKY_APP_PASSWORD", "secret")
+    login = respx.post("https://bsky.social/xrpc/com.atproto.server.createSession").respond(
+        status, json={"accessJwt": "secret-token", "did": "did:plc:test", "didDoc": {
+            "id": "did:plc:test", "service": [{"id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": "https://test.host.bsky.network"}]}})
+    if status == 200:
+        search = respx.get(
+            "https://test.host.bsky.network/xrpc/app.bsky.feed.searchPosts"
+        ).respond(200, json={"posts": []})
+    results = collect(TERMS, sources=["bluesky"], db_path=str(tmp_path / "auth.db"))
+    assert login.call_count == 1
+    assert all(bool(result.errors) == (status != 200) for result in results)
+    if status == 200:
+        assert search.call_count == 3
+
+
 @pytest.mark.parametrize("failure", ["http", "network", "malformed"])
 def test_feed_failure_is_cached_without_retry_other_sources_still_land(tmp_path, routes, failure):
     _, hn, _, rss = routes
@@ -131,6 +152,32 @@ def test_long_retry_after_receipt_preserves_server_delay(tmp_path, routes, monke
     assert FEED not in receipt_path.read_text()
     assert json.loads(capsys.readouterr().out)["retry_after_seconds"] == 7200
     assert rss.call_count == 1
+
+
+@pytest.mark.parametrize("login_status", [200, 429])
+@respx.mock
+def test_bluesky_cooldown_reaches_receipt_once_per_login(
+    tmp_path, monkeypatch, login_status,
+):
+    monkeypatch.setenv("HARKEN_BLUESKY_HANDLE", "test.bsky.social")
+    monkeypatch.setenv("HARKEN_BLUESKY_APP_PASSWORD", "secret")
+    monkeypatch.setenv("HARKEN_RSS_FEEDS", FEED)
+    login = respx.post("https://bsky.social/xrpc/com.atproto.server.createSession").respond(
+        login_status, headers={"Retry-After": "7200"},
+        json={"accessJwt": "secret-token", "did": "did:plc:test", "didDoc": {
+            "id": "did:plc:test", "service": [{"id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": "https://test.host.bsky.network"}]}})
+    if login_status == 200:
+        respx.get("https://test.host.bsky.network/xrpc/app.bsky.feed.searchPosts").respond(
+            429, headers={"Retry-After": "7200"}, text="secret-token")
+    respx.get(FEED).respond(429, headers={"Retry-After": "3600"})
+    receipt = tmp_path / "cooldown.json"
+    assert main(["--terms", *TERMS, "--sources", "bluesky,rss",
+                 "--db", str(tmp_path / "cooldown.db"), "--receipt", str(receipt)]) == 1
+    assert login.call_count == 1
+    assert json.loads(receipt.read_text())["retry_after_seconds"] == 7200
+    assert "secret" not in receipt.read_text()
 
 
 @pytest.mark.parametrize("header", ["-1", "NaN", "invalid"])
